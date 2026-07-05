@@ -93,6 +93,11 @@ if(DERECH_BUILD_TESTS)
 	add_library(derech_test_support STATIC
 		tests/support.c)
 	target_link_libraries(derech_test_support PUBLIC derech)
+	if(NOT WIN32)
+		# tests use llround/nanf from libm — separate on glibc,
+		# implicit inside libSystem on macOS
+		target_link_libraries(derech_test_support PUBLIC m)
+	endif()
 	target_include_directories(derech_test_support PUBLIC tests src)
 	set_target_properties(derech_test_support PROPERTIES
 		C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
