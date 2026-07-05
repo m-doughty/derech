@@ -1,0 +1,131 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64-gcc, os: ubuntu-24.04, cc: gcc }
+          - { name: linux-x86_64-clang, os: ubuntu-24.04, cc: clang }
+          - { name: linux-aarch64-gcc, os: ubuntu-24.04-arm, cc: gcc }
+          - { name: macos-arm64, os: macos-14, cc: clang }
+          - { name: windows-x86_64-msvc, os: windows-2022 }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DDERECH_WERROR=ON -DCMAKE_BUILD_TYPE=Release
+        env:
+          CC: ${{ matrix.cc }}
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitize:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    name: asan-ubsan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DDERECH_WERROR=ON -DDERECH_SANITIZE=ON
+          -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  tsan:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    name: tsan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DDERECH_WERROR=ON -DDERECH_TSAN=ON
+          -DCMAKE_BUILD_TYPE=Debug
+        env:
+          CC: clang
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  shared:
+    name: shared-lib build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DDERECH_WERROR=ON -DBUILD_SHARED_LIBS=ON
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # The counter gate doubles as a cross-platform determinism check: the
+  # baselines are integers that must match bit-for-bit on every OS,
+  # compiler, and thread count.  Timings are printed but never gated.
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    name: bench-counters (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DDERECH_WERROR=ON -DDERECH_BUILD_TESTS=OFF
+          -DDERECH_BUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Counter gate
+        run: >
+          ctest --test-dir build -C Release -R bench_counters
+          --output-on-failure
+
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DDERECH_WERROR=ON -DDERECH_BUILD_TESTS=OFF
+          -DDERECH_FUZZ=ON -DCMAKE_BUILD_TYPE=Debug
+        env:
+          CC: clang
+      - name: Build
+        run: cmake --build build
+      - name: Fuzz for 90 seconds
+        run: |
+          mkdir -p corpus
+          cp fuzz/corpus/* corpus/ 2>/dev/null || true
+          ./build/fuzz_derech -max_total_time=90 -print_final_stats=1 \
+            -artifact_prefix=crash- corpus
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crash-*
+          if-no-files-found: ignore
