@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /* derech woodcutters demo — discovery, goal sets, and the dirty-region
  * cache in one loop.
  *
@@ -901,11 +905,13 @@ static int run_ui(int demo_seconds)
 
 int main(int argc, char **argv)
 {
+#if !defined(DEMO_SELFTEST_ONLY) && !defined(_WIN32)
 	if (getenv("TERMINFO") == NULL || getenv("TERMINFO_DIRS") == NULL) {
 		setenv("TERMINFO_DIRS",
 			"/usr/share/terminfo:/etc/terminfo:/lib/terminfo:"
 			"/usr/lib/terminfo", 0);
 	}
+#endif
 
 	build_world();
 	setup_derech();

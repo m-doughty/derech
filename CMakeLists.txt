@@ -210,10 +210,15 @@ if(DERECH_BUILD_TESTS)
 	endif()
 	add_test(NAME oom COMMAND test_oom)
 
+	if(BUILD_SHARED_LIBS)
+		set(DERECH_INSTALL_TEST_EXPECT_STATIC OFF)
+	else()
+		set(DERECH_INSTALL_TEST_EXPECT_STATIC ON)
+	endif()
 	configure_file(cmake/VerifyInstall.cmake.in
 		"${CMAKE_CURRENT_BINARY_DIR}/VerifyInstall.cmake" @ONLY)
 	add_test(NAME install_consumer COMMAND ${CMAKE_COMMAND}
-		-DERECH_TEST_CONFIG=$<CONFIG>
+		-DDERECH_TEST_CONFIG=$<CONFIG>
 		-P "${CMAKE_CURRENT_BINARY_DIR}/VerifyInstall.cmake")
 	add_test(NAME version_consistency COMMAND ${CMAKE_COMMAND}
 		-DDERECH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

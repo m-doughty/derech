@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /* derech village demo — 100 NPCs living out daily schedules on a
  * weighted tile map, all pathfinding through batched derech calls.
  *
@@ -943,6 +947,7 @@ static int run_ui(int demo_seconds)
 
 int main(int argc, char **argv)
 {
+#if !defined(DEMO_SELFTEST_ONLY) && !defined(_WIN32)
 	/* a vendored ncurses may have a baked-in terminfo path from its
 	 * build machine, and a terminal-specific $TERMINFO (kitty's, say)
 	 * only covers its own entry.  ncurses searches $TERMINFO first and
@@ -952,6 +957,7 @@ int main(int argc, char **argv)
 	setenv("TERMINFO_DIRS",
 		"/usr/share/terminfo:/etc/terminfo:/lib/terminfo:"
 		"/usr/lib/terminfo", 0);
+#endif
 
 	build_world();
 	setup_npcs();

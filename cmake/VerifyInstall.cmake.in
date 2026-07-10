@@ -2,11 +2,7 @@ set(_root "@CMAKE_CURRENT_BINARY_DIR@/install-consumer")
 set(_stage "${_root}/stage")
 set(_relocated "${_root}/relocated")
 set(_consumer_build "${_root}/build")
-if("@BUILD_SHARED_LIBS@")
-	set(_expect_static OFF)
-else()
-	set(_expect_static ON)
-endif()
+set(_expect_static "@DERECH_INSTALL_TEST_EXPECT_STATIC@")
 
 file(LOCK "@CMAKE_CURRENT_BINARY_DIR@/install-consumer.lock"
 	GUARD PROCESS TIMEOUT 300 RESULT_VARIABLE _lock_result)
