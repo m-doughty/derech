@@ -43,6 +43,15 @@ struct derech_results {
 	uint64_t steps_len;
 };
 
+static int checked_array_bytes(uint64_t count, size_t item_size, size_t *out)
+{
+	if (item_size != 0 && count > SIZE_MAX / item_size) {
+		return 0;
+	}
+	*out = (size_t)count * item_size;
+	return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Per-worker path emission                                            */
 /* ------------------------------------------------------------------ */
@@ -468,6 +477,7 @@ static derech_status plan_and_execute(derech_map *map,
 	uint8_t *action = NULL;
 	uint32_t *next = NULL;
 	plan_group *groups = NULL;
+	size_t t1_bytes, t2_bytes, next_bytes, groups_bytes;
 	uint32_t group_cap = 16;
 	uint32_t n1 = 0, n2 = 0;
 	derech_status rc = DERECH_E_NOMEM;
@@ -486,17 +496,17 @@ static derech_status plan_and_execute(derech_map *map,
 		}
 		group_cap *= 2;
 	}
-	if ((size_t)n_reqs > SIZE_MAX / (2 * sizeof(*t1)) ||
-		(size_t)n_reqs > SIZE_MAX / sizeof(*t2) ||
-		(size_t)n_reqs > SIZE_MAX / sizeof(*next) ||
-		(size_t)group_cap > SIZE_MAX / sizeof(*groups)) {
+	if (!checked_array_bytes(n_reqs, 2 * sizeof(*t1), &t1_bytes) ||
+		!checked_array_bytes(n_reqs, sizeof(*t2), &t2_bytes) ||
+		!checked_array_bytes(n_reqs, sizeof(*next), &next_bytes) ||
+		!checked_array_bytes(group_cap, sizeof(*groups), &groups_bytes)) {
 		goto done;
 	}
-	t1 = malloc((size_t)n_reqs * 2 * sizeof(*t1));
-	t2 = malloc((size_t)n_reqs * sizeof(*t2));
+	t1 = malloc(t1_bytes);
+	t2 = malloc(t2_bytes);
 	action = malloc(n_reqs);
-	next = malloc((size_t)n_reqs * sizeof(*next));
-	groups = calloc(group_cap, sizeof(*groups));
+	next = malloc(next_bytes);
+	groups = calloc(1, groups_bytes);
 	if (t1 == NULL || t2 == NULL || action == NULL || next == NULL ||
 		groups == NULL) {
 		goto done;
@@ -723,6 +733,7 @@ derech_status derech_find_paths_ex(derech_map *map,
 {
 	derech_results *r;
 	derech_stage_row *stage = NULL;
+	size_t rows_bytes, stage_bytes;
 	derech_status rc;
 
 	if (map == NULL || out == NULL || (reqs == NULL && n_reqs > 0) ||
@@ -760,16 +771,16 @@ derech_status derech_find_paths_ex(derech_map *map,
 		*out = r;
 		return DERECH_OK;
 	}
-	if ((size_t)n_reqs > SIZE_MAX / sizeof(*r->rows) ||
-		(size_t)n_reqs > SIZE_MAX / sizeof(*stage)) {
+	if (!checked_array_bytes(n_reqs, sizeof(*r->rows), &rows_bytes) ||
+		!checked_array_bytes(n_reqs, sizeof(*stage), &stage_bytes)) {
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
 		return DERECH_E_NOMEM;
 	}
 
-	r->rows = calloc(n_reqs, sizeof(*r->rows));
-	stage = calloc(n_reqs, sizeof(*stage));
+	r->rows = calloc(1, rows_bytes);
+	stage = calloc(1, stage_bytes);
 	if (r->rows == NULL || stage == NULL) {
 		free(stage);
 		map->active_cancel = NULL;

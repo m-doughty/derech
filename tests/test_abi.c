@@ -180,14 +180,8 @@ static void test_request_validation(void)
 {
 	derech_map *map = derech_map_create(3, 1, NULL);
 	derech_profile_desc profile = t_neutral_desc();
-	union {
-		max_align_t align;
-		unsigned char bytes[544];
-	} legacy64;
-	union {
-		max_align_t align;
-		unsigned char bytes[540];
-	} legacy32;
+	_Alignas(derech_profile_desc) unsigned char legacy64[544];
+	_Alignas(derech_profile_desc) unsigned char legacy32[540];
 	derech_request q = request(0, 0, 2, 0);
 	derech_results *results = NULL;
 	uint32_t legacy_size;
@@ -198,17 +192,17 @@ static void test_request_validation(void)
 	profile.reserved2 = 0;
 	T_CHECK(derech_profile_register(map, &profile) == 0);
 
-	memset(&legacy64, 0, sizeof(legacy64));
+	memset(legacy64, 0, sizeof(legacy64));
 	legacy_size = 544;
-	memcpy(legacy64.bytes, &legacy_size, sizeof(legacy_size));
-	memset(legacy64.bytes + 12, 0xA5, 4); /* former 64-bit padding */
+	memcpy(legacy64, &legacy_size, sizeof(legacy_size));
+	memset(legacy64 + 12, 0xA5, 4); /* former 64-bit padding */
 	T_CHECK(derech_profile_register(map,
-		(const derech_profile_desc *)legacy64.bytes) == 1);
-	memset(&legacy32, 0, sizeof(legacy32));
+		(const derech_profile_desc *)(const void *)legacy64) == 1);
+	memset(legacy32, 0, sizeof(legacy32));
 	legacy_size = 540;
-	memcpy(legacy32.bytes, &legacy_size, sizeof(legacy_size));
+	memcpy(legacy32, &legacy_size, sizeof(legacy_size));
 	T_CHECK(derech_profile_register(map,
-		(const derech_profile_desc *)legacy32.bytes) == 2);
+		(const derech_profile_desc *)(const void *)legacy32) == 2);
 	T_CHECK(derech_find_paths(map, &q, 1, &results) == DERECH_OK);
 	T_CHECK(results != NULL);
 	T_CHECK(derech_result_status(results, 0) == DERECH_PATH_FOUND);
