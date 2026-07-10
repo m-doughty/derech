@@ -46,7 +46,7 @@ through an FFI (Python cffi, Raku NativeCall, LuaJIT, C#, ...).
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build          # 5 suites, ~7,000 checks
+ctest --test-dir build --output-on-failure
 ```
 
 Static library by default; add `-DBUILD_SHARED_LIBS=ON` for a shared
@@ -54,6 +54,28 @@ build (FFI hosts usually want this). Supported first-class: macOS arm64,
 Linux x86_64/aarch64 (GCC or Clang), Windows x86_64 (MSVC). Do **not**
 build with `-ffast-math` — determinism depends on well-behaved float →
 fixed-point conversion.
+
+Install and consume the exported CMake target:
+
+```sh
+cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(derech 0.5 CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE derech::derech)
+```
+
+The installation also includes a relocatable `derech.pc`:
+
+```sh
+cc host.c $(pkg-config --cflags --libs derech)
+```
+
+Static pkg-config consumers should add `--static`. The installed shared
+library has ABI soname epoch `1`; headers expose `DERECH_ABI_VERSION`, and
+bindings can compare it with `derech_abi_version()` before exchanging public
+structures. See [INSTALL.md](INSTALL.md) for platform-neutral package details.
 
 Extra verification targets:
 
@@ -72,16 +94,14 @@ cmake --build build-fuzz
 ./build-fuzz/fuzz_derech -max_total_time=300 fuzz/corpus
 ```
 
-CI runs the unit/property suites on five platform/compiler lanes, the
-ASan/UBSan and TSan suites, a shared-lib build, the counter gate on
-Linux + macOS + Windows (which doubles as a cross-platform determinism
-check), and a corpus-seeded fuzz smoke run.  A separate nightly
-workflow fuzzes for 45 minutes in fork mode, resuming from the
-persistent corpus (Actions cache as the warm layer, the committed
-`fuzz/corpus/` as the durable one) and committing corpus growth back —
-which also counts as repo activity, keeping the schedule alive under
-GitHub's 60-day inactivity rule for as long as fuzzing keeps finding
-new coverage.
+CI runs twelve core, ABI, concurrency, resource, OOM, and property-test executables
+on five platform/compiler lanes. ASan/UBSan and TSan suites also include both
+headless demo self-tests. Shared and installed-consumer builds run on Linux,
+macOS, and Windows, with a relocated CMake/pkg-config package test, the counter
+gate on all three operating systems, and a corpus-seeded fuzz smoke run. A
+separate nightly workflow fuzzes for 45 minutes in fork mode and proposes
+corpus growth through a bot-owned pull request; it never pushes directly to
+the primary branch.
 
 ## Demos
 
@@ -102,6 +122,14 @@ cmake --build build && ./build/derech_village
 
 Without pkg-config'd notcurses, point at any build of it with
 `-DDERECH_NOTCURSES_INCLUDE=<dir> -DDERECH_NOTCURSES_LIB=<dir>`.
+On macOS and Linux, the headless checks need no notcurses installation:
+
+```sh
+cmake -B build-selftest -DDERECH_BUILD_DEMO_SELFTESTS=ON
+cmake --build build-selftest
+ctest --test-dir build-selftest -R demo_ --output-on-failure
+```
+
 Controls: arrows/WASD scroll, `f`/TAB follow a moving NPC (its
 remaining path is drawn), SPACE pause, `1-3` speed, `q` quit.
 `--selftest` runs three headless days and asserts everyone makes it
@@ -136,10 +164,12 @@ villager.tag_mult[2] = 0.8f;          /* likes roads            */
 int32_t villager_id = derech_profile_register(map, &villager);
 
 derech_request reqs[2] = {
-	{ .start_x = 3, .start_y = 4, .goal_x = 400, .goal_y = 220,
+	{ .struct_size = sizeof(derech_request),
+	  .start_x = 3, .start_y = 4, .goal_x = 400, .goal_y = 220,
 	  .profile_id = (uint32_t)villager_id,
 	  .flags = DERECH_REQ_ALLOW_PARTIAL },
-	{ .start_x = 9, .start_y = 9, .goal_x = 40, .goal_y = 41,
+	{ .struct_size = sizeof(derech_request),
+	  .start_x = 9, .start_y = 9, .goal_x = 40, .goal_y = 41,
 	  .profile_id = (uint32_t)villager_id, .epsilon = 1.0f },
 };
 
@@ -165,10 +195,18 @@ reference manual.
 ## FFI notes
 
 derech's API is designed for bindings: opaque handles, fixed-layout POD
-structs with a `struct_size` field, no callbacks, no globals, no
-thread-local error state. Inputs are copied during the call; results are
-flat primitive arrays owned by the library until `derech_results_destroy`,
-so hosts can view step buffers zero-copy.
+structs with a `struct_size` field, no callbacks, no globals, no thread-local
+error state. `derech_request` is fixed at 64 bytes for ABI epoch 1 and keeps
+reserved words for compatible growth. Inputs are copied during the call;
+results are flat primitive arrays owned by the library until
+`derech_results_destroy`, so hosts can view step buffers zero-copy. Bindings
+should check `derech_abi_version()` and their expected structure sizes at
+startup. [ABI.md](ABI.md) records the epoch-1 compatibility rules and binding
+checklist.
+
+The snippets below are illustrative FFI declaration sketches, not maintained
+bindings. Production bindings must declare the complete public layouts, locate
+the native library per platform, and perform the ABI checks above.
 
 Python (cffi):
 
@@ -206,14 +244,18 @@ sub derech_result_steps(DerechResults, uint32 --> CArray[uint32])
 
 ## Status & roadmap
 
-v0.3 — core engine, parallel batches, and batch structure: terrain +
-tags + profiles, batched weighted A* on a persistent worker pool
-(bitwise thread-count invariance, verified by tests and
-ThreadSanitizer), goal-field grouping with an LRU field cache,
-component-label unreachability, partial paths, budgets, exhaustive
-tests (unit, golden-scenario, and property tests cross-checked against
-an independent reference Dijkstra), ASan/UBSan/TSan-clean, 5-platform
-CI.
+Current source version: **v0.5.0**, ABI epoch 1. Cumulative costs use 64-bit
+fixed point with eight fractional bits, with exact integer accessors alongside
+the convenience float accessors. Fixed worker state, field working sets, label
+caches, and retained scratch are bounded and observable; worker contexts are
+allocated on demand. Map APIs use a race-free nonblocking single-owner
+contract, required allocation failures are reported as `DERECH_E_NOMEM`, and
+long calls support cooperative cancellation through `derech_find_paths_ex`.
+
+The core remains synchronous: hosts should schedule expensive calls away from
+UI or event-loop threads. Results are deterministic across supported platforms
+and thread counts, with randomized property tests checked against an
+independent Dijkstra implementation and ASan/UBSan/TSan CI coverage.
 
 Planned next:
 
@@ -227,3 +269,6 @@ and 3D grids.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Maintainers: the gated draft-release process is documented in
+[RELEASING.md](RELEASING.md).

@@ -40,6 +40,7 @@ jobs:
       - name: Configure
         run: >
           cmake -B build -DDERECH_WERROR=ON -DDERECH_SANITIZE=ON
+          -DDERECH_BUILD_DEMO_SELFTESTS=ON
           -DCMAKE_BUILD_TYPE=Debug
       - name: Build
         run: cmake --build build
@@ -58,6 +59,7 @@ jobs:
       - name: Configure
         run: >
           cmake -B build -DDERECH_WERROR=ON -DDERECH_TSAN=ON
+          -DDERECH_BUILD_DEMO_SELFTESTS=ON
           -DCMAKE_BUILD_TYPE=Debug
         env:
           CC: clang
@@ -67,18 +69,92 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   shared:
-    name: shared-lib build
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux, os: ubuntu-24.04, cc: gcc }
+          - { name: macos, os: macos-14, cc: clang }
+          - { name: windows, os: windows-2022 }
+    name: shared-lib (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
         run: >
           cmake -B build -DDERECH_WERROR=ON -DBUILD_SHARED_LIBS=ON
           -DCMAKE_BUILD_TYPE=Release
+        env:
+          CC: ${{ matrix.cc }}
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --config Release
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { linkage: static, shared: 'OFF', expect_static: 'ON', static_value: 1 }
+          - { linkage: shared, shared: 'ON', expect_static: 'OFF', static_value: 0 }
+    name: relocated ${{ matrix.linkage }} package + pkg-config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure package
+        run: >
+          cmake -B build-package -DDERECH_WERROR=ON
+          -DDERECH_BUILD_TESTS=OFF
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-package
+      - name: Install then relocate
+        run: |
+          cmake --install build-package --prefix "$RUNNER_TEMP/derech-stage"
+          mv "$RUNNER_TEMP/derech-stage" "$RUNNER_TEMP/derech-relocated"
+      - name: Test C and C++ CMake consumers
+        run: |
+          cmake -S cmake/tests/consumer -B build-consumer \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/derech-relocated" \
+            -DDERECH_EXPECT_STATIC=${{ matrix.expect_static }} \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-consumer
+          ctest --test-dir build-consumer --output-on-failure
+      - name: Test relocated pkg-config consumer
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/derech-relocated/lib/pkgconfig"
+          test "$(pkg-config --modversion derech)" = "0.5.0"
+          if [ "${{ matrix.expect_static }}" = "ON" ]; then
+            pc_static=--static
+            pkg-config --cflags --static derech | grep -- -DDERECH_STATIC
+          else
+            pc_static=
+            if pkg-config --cflags derech | grep -q -- -DDERECH_STATIC; then
+              echo "shared package leaked DERECH_STATIC" >&2
+              exit 1
+            fi
+          fi
+          cc -std=c17 cmake/tests/consumer/consumer.c \
+            $(pkg-config $pc_static --cflags --libs derech) \
+            -DDERECH_EXPECT_STATIC=${{ matrix.static_value }} \
+            -o build-consumer/pkgconfig-consumer
+          LD_LIBRARY_PATH="$RUNNER_TEMP/derech-relocated/lib" \
+            ./build-consumer/pkgconfig-consumer
+
+  version:
+    name: release version consistency
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check project, changelog, and release tag
+        env:
+          DERECH_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: >
+          cmake -DDERECH_SOURCE_DIR="$PWD"
+          -DDERECH_RELEASE_TAG="$DERECH_RELEASE_TAG"
+          -P cmake/CheckReleaseVersion.cmake
 
   # The counter gate doubles as a cross-platform determinism check: the
   # baselines are integers that must match bit-for-bit on every OS,

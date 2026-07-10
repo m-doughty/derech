@@ -11,6 +11,34 @@
 #include "derech.h"
 
 /* ------------------------------------------------------------------ */
+/* Internal allocation boundary                                       */
+/* ------------------------------------------------------------------ */
+
+void *derech_malloc(size_t size);
+void *derech_calloc(size_t count, size_t size);
+void *derech_realloc(void *ptr, size_t size);
+void derech_free(void *ptr);
+
+#ifdef DERECH_TESTING
+/* Fail exactly one allocation: the one after `successful_allocations`
+ * successful attempts following this call.  Passing 0 fails the next
+ * allocation.  The attempt counter includes the injected failure. */
+void derech_test_alloc_fail_after(uint64_t successful_allocations);
+void derech_test_alloc_disable(void);
+uint64_t derech_test_alloc_attempts(void);
+#endif
+
+/* DERECH_BUILD is private to the library target, so tests that include
+ * this header keep using libc directly.  alloc.c suppresses the remap to
+ * implement the boundary in terms of the real allocator. */
+#if defined(DERECH_BUILD) && !defined(DERECH_ALLOC_IMPLEMENTATION)
+#define malloc(size) derech_malloc(size)
+#define calloc(count, size) derech_calloc((count), (size))
+#define realloc(ptr, size) derech_realloc((ptr), (size))
+#define free(ptr) derech_free(ptr)
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Atomics shim (MSVC's C17 mode lacks <stdatomic.h>)                  */
 /* ------------------------------------------------------------------ */
 
@@ -20,6 +48,7 @@
 
 typedef volatile long derech_busy_flag;
 typedef volatile long derech_atomic_u32;
+typedef volatile __int64 derech_atomic_u64;
 
 static inline int derech_busy_acquire(derech_busy_flag *f)
 {
@@ -48,12 +77,30 @@ static inline void derech_atomic_store_u32(derech_atomic_u32 *a, uint32_t v)
 	_InterlockedExchange(a, (long)v);
 }
 
+static inline uint64_t derech_atomic_load_u64(const derech_atomic_u64 *a)
+{
+	return (uint64_t)_InterlockedCompareExchange64(
+		(volatile __int64 *)a, 0, 0);
+}
+
+static inline void derech_atomic_store_u64(derech_atomic_u64 *a, uint64_t v)
+{
+	_InterlockedExchange64(a, (__int64)v);
+}
+
+static inline uint64_t derech_atomic_fetch_add_u64(derech_atomic_u64 *a,
+	uint64_t v)
+{
+	return (uint64_t)_InterlockedExchangeAdd64(a, (__int64)v);
+}
+
 #else
 
 #include <stdatomic.h>
 
 typedef atomic_int derech_busy_flag;
 typedef atomic_uint derech_atomic_u32;
+typedef atomic_uint_fast64_t derech_atomic_u64;
 
 static inline int derech_busy_acquire(derech_busy_flag *f)
 {
@@ -82,10 +129,26 @@ static inline void derech_atomic_store_u32(derech_atomic_u32 *a, uint32_t v)
 	atomic_store(a, v);
 }
 
+static inline uint64_t derech_atomic_load_u64(const derech_atomic_u64 *a)
+{
+	return atomic_load(a);
+}
+
+static inline void derech_atomic_store_u64(derech_atomic_u64 *a, uint64_t v)
+{
+	atomic_store(a, v);
+}
+
+static inline uint64_t derech_atomic_fetch_add_u64(derech_atomic_u64 *a,
+	uint64_t v)
+{
+	return atomic_fetch_add(a, v);
+}
+
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Q8.8 cost constants                                                 */
+/* Cost constants with eight fractional bits                           */
 /* ------------------------------------------------------------------ */
 
 #define DERECH_Q_ONE 256u                  /* one tick                   */
@@ -94,7 +157,7 @@ static inline void derech_atomic_store_u32(derech_atomic_u32 *a, uint32_t v)
 #define DERECH_Q_MULT_BLOCKED UINT32_MAX   /* profile entry sentinel     */
 #define DERECH_Q_DIAG_SQRT2 362u           /* round(sqrt(2) * 256)       */
 #define DERECH_Q_EPS_DEFAULT 320u          /* round(1.25 * 256)          */
-#define DERECH_G_INFINITE UINT32_MAX
+#define DERECH_G_INFINITE UINT64_MAX
 
 /* Round a non-negative double to uint32 with saturation at `cap`.
  * All float->fixed conversions go through this so quantization is
@@ -108,6 +171,17 @@ static inline uint32_t derech_q_round(double v, uint32_t cap)
 		return 0;
 	}
 	return (uint32_t)(v + 0.5);
+}
+
+static inline uint64_t derech_q_round_u64(double v, uint64_t cap)
+{
+	if (v >= (double)cap) {
+		return cap;
+	}
+	if (v <= 0.0) {
+		return 0;
+	}
+	return (uint64_t)(v + 0.5);
 }
 
 static inline uint32_t derech_sat_u32(uint64_t v)
@@ -143,8 +217,8 @@ typedef struct derech_profile {
 } derech_profile;
 
 typedef struct derech_heap_entry {
-	uint32_t f;
-	uint32_t g;
+	uint64_t f;
+	uint64_t g;
 	uint32_t idx;
 } derech_heap_entry;
 
@@ -157,13 +231,13 @@ typedef struct derech_combo_slot {
  * thread at a time; the out_* buffers hold reconstructed paths until the
  * (single-threaded) assembly phase copies them into the results arena. */
 typedef struct derech_search_ctx {
-	uint32_t *g;
+	uint64_t *g;
 	uint32_t *stamp;
 	uint8_t *parent; /* 0 = none, else direction index + 1 */
 	uint32_t stamp_gen;
 	derech_heap_entry *heap;
 	uint64_t heap_cap;
-	uint32_t *path_scratch; /* n */
+	int initialized;
 
 	uint32_t *out_steps; /* interleaved x,y — 2 per step */
 	float *out_ticks;    /* 1 per step */
@@ -179,8 +253,8 @@ typedef struct derech_stage_row {
 	uint32_t worker;    /* which ctx's out buffers hold the steps */
 	uint64_t local_off; /* step offset within that ctx            */
 	uint64_t true_q;    /* summed base ticks, Q8                  */
-	uint32_t perceived_q;
-	int oom;            /* reconstruction allocation failure      */
+	uint64_t perceived_q;
+	derech_status error; /* required allocation/cancellation error */
 } derech_stage_row;
 
 typedef struct derech_pool derech_pool;
@@ -213,11 +287,14 @@ typedef struct derech_field {
 	uint32_t goalset_id;     /* DERECH_NO_GOALSET for single-goal      */
 	uint64_t set_epoch;      /* goalset->epoch this field was built at */
 	uint32_t profile_id;
-	uint32_t *dist_q;   /* n; DERECH_G_INFINITE = cannot reach goal */
+	uint64_t *dist_q;   /* n; DERECH_G_INFINITE = cannot reach goal */
 	uint8_t *next_dir;  /* n; direction index + 1 toward the goal   */
 	uint64_t bytes;     /* cache accounting                         */
 	int ok;             /* build completed successfully             */
 	int pinned;         /* in use by the current batch              */
+	derech_status error;
+	int new_in_call;
+	uint64_t touch_seq;
 	struct derech_field *lru_prev;
 	struct derech_field *lru_next;
 	struct derech_field *hash_next;
@@ -248,6 +325,9 @@ typedef struct derech_labels {
 	uint64_t block_mask;
 	uint64_t require_mask;
 	uint32_t *label; /* n; 0 = not enterable */
+	uint64_t last_use;
+	uint64_t touch_seq;
+	int new_in_call;
 } derech_labels;
 
 #define DERECH_MAX_LABEL_CLASSES 16u
@@ -268,7 +348,8 @@ typedef struct derech_task {
 struct derech_map {
 	uint32_t w, h;
 	uint32_t n; /* w * h */
-	uint64_t generation;
+	derech_atomic_u64 generation;
+	derech_atomic_u32 published_profile_count;
 	derech_busy_flag busy;
 
 	/* terrain */
@@ -289,8 +370,12 @@ struct derech_map {
 	/* batch execution: ctxs[0] belongs to the calling thread, the rest
 	 * to pool workers.  pool is NULL when n_threads == 1. */
 	uint32_t n_threads;
+	uint32_t allocated_contexts;
 	derech_search_ctx *ctxs;
 	derech_pool *pool;
+	uint64_t worker_budget_bytes;
+	uint64_t scratch_retention_bytes;
+	const struct derech_cancel *active_cancel;
 
 	/* goal-field cache: hash by (goal-or-set, profile) + LRU by last
 	 * use, mutated only during single-threaded planning; invalidated
@@ -299,13 +384,21 @@ struct derech_map {
 	derech_field *field_lru_head;
 	derech_field *field_lru_tail;
 	uint64_t field_bytes;
+	uint64_t field_peak_bytes;
 	uint64_t field_budget_bytes;
+	uint64_t field_working_bytes;
+	uint64_t field_touch_clock;
 	uint32_t field_threshold;
 
 	/* component labels per blocking class; flushed when an edit could
 	 * change enterability for the class */
 	derech_labels label_classes[DERECH_MAX_LABEL_CLASSES];
 	uint32_t label_class_count;
+	uint64_t label_bytes;
+	uint64_t label_budget_bytes;
+	uint64_t label_working_bytes;
+	uint64_t label_clock;
+	uint64_t label_touch_clock;
 
 	/* goal sets + pending edits (reconciled at batch start) */
 	derech_goalset goalsets[DERECH_MAX_GOALSETS];
@@ -318,6 +411,8 @@ extern const int8_t derech_dir_dy[8];
 
 /* map.c */
 int derech_intern_tag_word(derech_map *map, uint64_t word, uint32_t *out_idx);
+derech_status derech_contexts_ensure(derech_map *map, uint32_t count);
+void derech_contexts_trim(derech_map *map);
 
 /* profile.c */
 void derech_profile_fold_combo(const derech_profile *p, uint64_t word,
@@ -328,11 +423,12 @@ typedef struct derech_search_result {
 	derech_path_status status;
 	uint32_t end_idx;    /* goal, or best partial endpoint */
 	uint32_t expansions;
+	derech_status error;
 } derech_search_result;
 
 void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
-	uint32_t eps_q, uint32_t max_expansions, uint32_t max_cost_q,
+	uint32_t eps_q, uint32_t max_expansions, uint64_t max_cost_q,
 	derech_search_result *out);
 
 /* batch.c — solve one request into ctx + stage; thread-safe across
@@ -361,17 +457,20 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 derech_field *derech_field_cache_lookup(derech_map *map, uint32_t goal_idx,
 	uint32_t goalset_id, uint32_t profile_id);
 derech_field *derech_field_cache_insert(derech_map *map, uint32_t goal_idx,
-	uint32_t goalset_id, uint32_t profile_id);
-void derech_field_cache_finish_batch(derech_map *map);
+	uint32_t goalset_id, uint32_t profile_id, derech_status *error);
+void derech_field_cache_end_wave(derech_map *map);
+void derech_field_cache_finish_batch(derech_map *map, int commit);
 void derech_field_cache_flush(derech_map *map);
 /* apply the dirty log: refresh predicate memberships, drop affected
  * fields and label classes, clear the log.  Planning phase only. */
-void derech_reconcile(derech_map *map);
-int derech_goalset_materialize(derech_map *map, derech_goalset *gs);
+derech_status derech_reconcile(derech_map *map);
+derech_status derech_goalset_materialize(derech_map *map,
+	derech_goalset *gs);
 void derech_goalset_free(derech_goalset *gs);
 const derech_labels *derech_labels_for(derech_map *map,
 	const derech_profile *prof);
 void derech_labels_flush(derech_map *map);
+void derech_labels_finish_call(derech_map *map, int commit);
 
 /* pool.c */
 uint32_t derech_hw_threads(void);
@@ -381,7 +480,7 @@ void derech_pool_destroy(derech_pool *pool);
  * every task is done. */
 void derech_pool_run(derech_pool *pool, derech_map *map,
 	const derech_task *tasks, uint32_t n_tasks, const derech_request *reqs,
-	derech_stage_row *stage);
+	derech_stage_row *stage, uint32_t n_participants);
 
 static inline int derech_tile_blocked(const derech_map *map,
 	const derech_profile *prof, uint32_t idx)
@@ -415,6 +514,17 @@ static inline uint32_t derech_perceived_step_q(const derech_map *map,
 		q = 1;
 	}
 	return derech_sat_u32(q);
+}
+
+struct derech_cancel {
+	derech_atomic_u32 requested;
+};
+
+static inline int derech_cancelled(const derech_map *map)
+{
+	return map->active_cancel != NULL &&
+		derech_atomic_load_u32(
+			(derech_atomic_u32 *)&map->active_cancel->requested) != 0;
 }
 
 #endif /* DERECH_INTERNAL_H */

@@ -29,6 +29,8 @@ typedef struct derech_res_row {
 	uint64_t off; /* first step index into the shared buffers */
 	uint32_t len;
 	uint32_t expansions;
+	uint64_t total_ticks_q8;
+	uint64_t total_perceived_q8;
 	float total_ticks;
 	float total_perceived;
 } derech_res_row;
@@ -52,22 +54,41 @@ int derech_ctx_out_reserve(derech_search_ctx *ctx, uint64_t extra)
 	uint32_t *steps;
 	float *ticks;
 
+	if (need < ctx->out_len) {
+		return 0;
+	}
 	if (need <= cap) {
 		return 1;
 	}
 	cap = cap == 0 ? 256 : cap;
 	while (cap < need) {
+		if (cap > UINT64_MAX / 2) {
+			return 0;
+		}
 		cap *= 2;
 	}
-	steps = realloc(ctx->out_steps, (size_t)cap * 2 * sizeof(*steps));
+	if (cap > SIZE_MAX / (2 * sizeof(*steps)) ||
+		cap > SIZE_MAX / sizeof(*ticks)) {
+		return 0;
+	}
+	steps = malloc((size_t)cap * 2 * sizeof(*steps));
 	if (steps == NULL) {
 		return 0;
 	}
-	ctx->out_steps = steps;
-	ticks = realloc(ctx->out_ticks, (size_t)cap * sizeof(*ticks));
+	ticks = malloc((size_t)cap * sizeof(*ticks));
 	if (ticks == NULL) {
+		free(steps);
 		return 0;
 	}
+	if (ctx->out_len > 0) {
+		memcpy(steps, ctx->out_steps,
+			(size_t)ctx->out_len * 2 * sizeof(*steps));
+		memcpy(ticks, ctx->out_ticks,
+			(size_t)ctx->out_len * sizeof(*ticks));
+	}
+	free(ctx->out_steps);
+	free(ctx->out_ticks);
+	ctx->out_steps = steps;
 	ctx->out_ticks = ticks;
 	ctx->out_cap = cap;
 	return 1;
@@ -76,7 +97,8 @@ int derech_ctx_out_reserve(derech_search_ctx *ctx, uint64_t extra)
 /* Walk parents back from end_idx, then emit the path forward (start tile
  * excluded) into the ctx's out buffers.  Returns 0 only on allocation
  * failure. */
-static int emit_path(const derech_map *map, derech_search_ctx *ctx,
+static derech_status emit_path(const derech_map *map,
+	derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t end_idx,
 	derech_stage_row *row)
 {
@@ -85,35 +107,42 @@ static int emit_path(const derech_map *map, derech_search_ctx *ctx,
 	uint64_t total_true_q = 0;
 
 	while (idx != start_idx) {
-		ctx->path_scratch[depth++] = idx;
-		{
-			uint32_t d = (uint32_t)ctx->parent[idx] - 1;
+		uint32_t d = (uint32_t)ctx->parent[idx] - 1;
 
-			idx -= (uint32_t)((int64_t)derech_dir_dx[d] +
-				(int64_t)derech_dir_dy[d] * map->w);
+		depth++;
+		idx -= (uint32_t)((int64_t)derech_dir_dx[d] +
+			(int64_t)derech_dir_dy[d] * map->w);
+		if ((depth & 1023u) == 0 && derech_cancelled(map)) {
+			return DERECH_E_CANCELLED;
 		}
 	}
 
 	if (!derech_ctx_out_reserve(ctx, depth)) {
-		return 0;
+		return DERECH_E_NOMEM;
 	}
 	row->local_off = ctx->out_len;
 	row->len = depth;
-	for (uint32_t i = 0; i < depth; i++) {
-		uint32_t step = ctx->path_scratch[depth - 1 - i];
+	idx = end_idx;
+	for (uint32_t pos = depth; pos > 0; pos--) {
+		uint32_t step = idx;
 		uint32_t d = (uint32_t)ctx->parent[step] - 1;
 		uint32_t q = derech_true_step_q(map, prof, step, d >= 4);
-		uint64_t at = ctx->out_len + i;
+		uint64_t at = ctx->out_len + pos - 1;
 
 		ctx->out_steps[at * 2] = step % map->w;
 		ctx->out_steps[at * 2 + 1] = step / map->w;
 		ctx->out_ticks[at] = (float)((double)q / 256.0);
 		total_true_q += q;
+		idx -= (uint32_t)((int64_t)derech_dir_dx[d] +
+			(int64_t)derech_dir_dy[d] * map->w);
+		if ((pos & 1023u) == 0 && derech_cancelled(map)) {
+			return DERECH_E_CANCELLED;
+		}
 	}
 	ctx->out_len += depth;
 	row->true_q = total_true_q;
 	row->perceived_q = ctx->g[end_idx];
-	return 1;
+	return DERECH_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -125,7 +154,8 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 {
 	const derech_profile *prof = &map->profiles[req->profile_id];
 	int allow_partial = (req->flags & DERECH_REQ_ALLOW_PARTIAL) != 0;
-	uint32_t start_idx, goal_idx, eps_q, max_exp, max_cost_q;
+	uint32_t start_idx, goal_idx, eps_q, max_exp;
+	uint64_t max_cost_q;
 	derech_search_result sr;
 
 	row->worker = worker;
@@ -151,12 +181,16 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 	eps_q = req->epsilon == 0.0f ? DERECH_Q_EPS_DEFAULT :
 		derech_q_round((double)req->epsilon * 256.0, 1u << 16);
 	max_exp = req->max_expansions == 0 ? map->n : req->max_expansions;
-	max_cost_q = req->max_perceived_cost == 0.0f ? UINT32_MAX :
-		derech_q_round((double)req->max_perceived_cost * 256.0,
-			UINT32_MAX - 1);
+	max_cost_q = req->max_perceived_cost == 0.0f ? UINT64_MAX :
+		derech_q_round_u64((double)req->max_perceived_cost * 256.0,
+			UINT64_MAX - 1);
 
 	derech_search(map, ctx, prof, start_idx, goal_idx, eps_q, max_exp,
 		max_cost_q, &sr);
+	if (sr.error != DERECH_OK) {
+		row->error = sr.error;
+		return;
+	}
 
 	row->status = sr.status;
 	row->expansions = sr.expansions;
@@ -164,8 +198,9 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 		(!allow_partial || sr.end_idx == start_idx)) {
 		return;
 	}
-	if (!emit_path(map, ctx, prof, start_idx, sr.end_idx, row)) {
-		row->oom = 1;
+	row->error = emit_path(map, ctx, prof, start_idx, sr.end_idx, row);
+	if (row->error != DERECH_OK) {
+		row->len = 0;
 	}
 }
 
@@ -198,6 +233,17 @@ static derech_status validate_requests(const derech_map *map,
 	for (uint32_t i = 0; i < n_reqs; i++) {
 		const derech_request *q = &reqs[i];
 
+		if ((i & 1023u) == 0 && derech_cancelled(map)) {
+			return DERECH_E_CANCELLED;
+		}
+		if (q->struct_size != sizeof(*q)) {
+			return DERECH_E_INVALID_ARG;
+		}
+		for (uint32_t r = 0; r < 5; r++) {
+			if (q->reserved[r] != 0) {
+				return DERECH_E_INVALID_ARG;
+			}
+		}
 		if (q->profile_id >= map->profile_count) {
 			return DERECH_E_BAD_PROFILE;
 		}
@@ -220,7 +266,7 @@ static derech_status validate_requests(const derech_map *map,
 			return DERECH_E_INVALID_ARG;
 		}
 		if (!(q->max_perceived_cost >= 0.0f) ||
-			q->max_perceived_cost > 16000000.0f) {
+			q->max_perceived_cost > DERECH_MAX_PATH_TICKS) {
 			return DERECH_E_INVALID_ARG;
 		}
 	}
@@ -234,12 +280,22 @@ static derech_status assemble_results(const derech_map *map,
 	uint64_t total = 0;
 
 	for (uint32_t i = 0; i < n_reqs; i++) {
-		if (stage[i].oom) {
-			return DERECH_E_NOMEM;
+		if ((i & 1023u) == 0 && derech_cancelled(map)) {
+			return DERECH_E_CANCELLED;
+		}
+		if (stage[i].error != DERECH_OK) {
+			return stage[i].error;
 		}
 		total += stage[i].len;
 	}
+	if (derech_cancelled(map)) {
+		return DERECH_E_CANCELLED;
+	}
 	if (total > 0) {
+		if (total > SIZE_MAX / (2 * sizeof(*r->steps)) ||
+			total > SIZE_MAX / sizeof(*r->ticks)) {
+			return DERECH_E_NOMEM;
+		}
 		r->steps = malloc((size_t)total * 2 * sizeof(*r->steps));
 		r->ticks = malloc((size_t)total * sizeof(*r->ticks));
 		if (r->steps == NULL || r->ticks == NULL) {
@@ -251,25 +307,42 @@ static derech_status assemble_results(const derech_map *map,
 		const derech_stage_row *s = &stage[i];
 		derech_res_row *row = &r->rows[i];
 
+		if ((i & 1023u) == 0 && derech_cancelled(map)) {
+			return DERECH_E_CANCELLED;
+		}
 		row->status = s->status;
 		row->expansions = s->expansions;
 		row->len = s->len;
 		row->off = r->steps_len;
 		if (s->len > 0) {
 			const derech_search_ctx *ctx = &map->ctxs[s->worker];
+			uint32_t copied = 0;
 
-			memcpy(&r->steps[r->steps_len * 2],
-				&ctx->out_steps[s->local_off * 2],
-				(size_t)s->len * 2 * sizeof(*r->steps));
-			memcpy(&r->ticks[r->steps_len],
-				&ctx->out_ticks[s->local_off],
-				(size_t)s->len * sizeof(*r->ticks));
+			while (copied < s->len) {
+				uint32_t chunk = s->len - copied;
+
+				if (chunk > 65536) {
+					chunk = 65536;
+				}
+				memcpy(&r->steps[(r->steps_len + copied) * 2],
+					&ctx->out_steps[(s->local_off + copied) * 2],
+					(size_t)chunk * 2 * sizeof(*r->steps));
+				memcpy(&r->ticks[r->steps_len + copied],
+					&ctx->out_ticks[s->local_off + copied],
+					(size_t)chunk * sizeof(*r->ticks));
+				copied += chunk;
+				if (derech_cancelled(map)) {
+					return DERECH_E_CANCELLED;
+				}
+			}
 			r->steps_len += s->len;
 			row->total_ticks =
 				(float)((double)s->true_q / 256.0);
 			row->total_perceived =
 				(float)((double)s->perceived_q / 256.0);
 		}
+		row->total_ticks_q8 = s->true_q;
+		row->total_perceived_q8 = s->perceived_q;
 	}
 	return DERECH_OK;
 }
@@ -286,9 +359,11 @@ enum {
 typedef struct plan_group {
 	uint64_t key; /* (goal_idx << 32) | profile_id */
 	uint32_t count;
+	uint32_t first;
+	uint32_t last;
 	uint8_t used;
-	uint8_t decided;
 	derech_field *field; /* NULL = members solve individually */
+	derech_status error;
 } plan_group;
 
 static plan_group *plan_group_slot(plan_group *tab, uint32_t cap,
@@ -307,20 +382,49 @@ static plan_group *plan_group_slot(plan_group *tab, uint32_t cap,
 	return &tab[i];
 }
 
-static void run_tasks(derech_map *map, const derech_task *tasks, uint32_t n,
+static derech_status run_tasks(derech_map *map, const derech_task *tasks,
+	uint32_t n,
 	const derech_request *reqs, derech_stage_row *stage)
 {
+	uint32_t participants;
+	derech_status rc;
+
 	if (n == 0) {
-		return;
+		return DERECH_OK;
 	}
-	if (map->pool != NULL && n > 1) {
-		derech_pool_run(map->pool, map, tasks, n, reqs, stage);
+	participants = n < map->n_threads ? n : map->n_threads;
+	rc = derech_contexts_ensure(map, participants);
+	if (rc != DERECH_OK) {
+		return rc;
+	}
+	if (map->pool != NULL && participants > 1) {
+		derech_pool_run(map->pool, map, tasks, n, reqs, stage,
+			participants);
 	} else {
 		for (uint32_t k = 0; k < n; k++) {
 			derech_run_task(map, &map->ctxs[0], 0, &tasks[k],
 				reqs, stage);
 		}
 	}
+	return DERECH_OK;
+}
+
+static derech_status execute_wave(derech_map *map, derech_task *t1,
+	uint32_t *n1, derech_task *t2, uint32_t *n2,
+	const derech_request *reqs, derech_stage_row *stage)
+{
+	derech_status rc = run_tasks(map, t1, *n1, reqs, stage);
+
+	if (rc == DERECH_OK) {
+		rc = run_tasks(map, t2, *n2, reqs, stage);
+	}
+	derech_field_cache_end_wave(map);
+	*n1 = 0;
+	*n2 = 0;
+	if (rc == DERECH_OK && derech_cancelled(map)) {
+		return DERECH_E_CANCELLED;
+	}
+	return rc;
 }
 
 /* True when the component labels prove the request unreachable.  A
@@ -362,6 +466,7 @@ static derech_status plan_and_execute(derech_map *map,
 	derech_task *t1 = NULL;
 	derech_task *t2 = NULL;
 	uint8_t *action = NULL;
+	uint32_t *next = NULL;
 	plan_group *groups = NULL;
 	uint32_t group_cap = 16;
 	uint32_t n1 = 0, n2 = 0;
@@ -369,16 +474,31 @@ static derech_status plan_and_execute(derech_map *map,
 
 	/* apply pending edits: refresh predicate goal sets, drop caches the
 	 * edits could actually affect */
-	derech_reconcile(map);
+	rc = derech_reconcile(map);
+	if (rc != DERECH_OK) {
+		goto done;
+	}
+	rc = DERECH_E_NOMEM;
 
 	while (group_cap < 2ull * n_reqs) {
+		if (group_cap > UINT32_MAX / 2) {
+			goto done;
+		}
 		group_cap *= 2;
+	}
+	if ((size_t)n_reqs > SIZE_MAX / (2 * sizeof(*t1)) ||
+		(size_t)n_reqs > SIZE_MAX / sizeof(*t2) ||
+		(size_t)n_reqs > SIZE_MAX / sizeof(*next) ||
+		(size_t)group_cap > SIZE_MAX / sizeof(*groups)) {
+		goto done;
 	}
 	t1 = malloc((size_t)n_reqs * 2 * sizeof(*t1));
 	t2 = malloc((size_t)n_reqs * sizeof(*t2));
 	action = malloc(n_reqs);
+	next = malloc((size_t)n_reqs * sizeof(*next));
 	groups = calloc(group_cap, sizeof(*groups));
-	if (t1 == NULL || t2 == NULL || action == NULL || groups == NULL) {
+	if (t1 == NULL || t2 == NULL || action == NULL || next == NULL ||
+		groups == NULL) {
 		goto done;
 	}
 
@@ -391,6 +511,10 @@ static derech_status plan_and_execute(derech_map *map,
 		uint32_t start_idx, goal_idx;
 		derech_field *cached;
 
+		if ((i & 255u) == 0 && derech_cancelled(map)) {
+			rc = DERECH_E_CANCELLED;
+			goto done;
+		}
 		action[i] = PLAN_DONE;
 		if (q->start_x >= map->w || q->start_y >= map->h) {
 			row->status = DERECH_PATH_INVALID_ENDPOINT;
@@ -418,7 +542,12 @@ static derech_status plan_and_execute(derech_map *map,
 				if (!g->used) {
 					g->used = 1;
 					g->key = key;
+					g->first = i;
+				} else {
+					next[g->last] = i;
 				}
+				g->last = i;
+				next[i] = UINT32_MAX;
 				g->count++;
 				action[i] = PLAN_GROUP;
 			}
@@ -449,6 +578,10 @@ static derech_status plan_and_execute(derech_map *map,
 		if (!allow_partial) {
 			const derech_labels *lc = derech_labels_for(map, prof);
 
+			if (derech_cancelled(map)) {
+				rc = DERECH_E_CANCELLED;
+				goto done;
+			}
 			if (lc != NULL && labels_prove_unreachable(map, lc,
 				start_idx, goal_idx)) {
 				row->status = DERECH_PATH_UNREACHABLE;
@@ -473,7 +606,12 @@ static derech_status plan_and_execute(derech_map *map,
 			if (!g->used) {
 				g->used = 1;
 				g->key = key;
+				g->first = i;
+			} else {
+				next[g->last] = i;
 			}
+			g->last = i;
+			next[i] = UINT32_MAX;
 			g->count++;
 			action[i] = PLAN_GROUP;
 		}
@@ -485,6 +623,10 @@ static derech_status plan_and_execute(derech_map *map,
 		uint64_t key;
 		plan_group *g;
 
+		if ((i & 255u) == 0 && derech_cancelled(map)) {
+			rc = DERECH_E_CANCELLED;
+			goto done;
+		}
 		if (action[i] != PLAN_GROUP) {
 			continue;
 		}
@@ -496,92 +638,141 @@ static derech_status plan_and_execute(derech_map *map,
 				<< 32) | q->profile_id;
 		}
 		g = plan_group_slot(groups, group_cap, key);
-		if (!g->decided) {
-			g->decided = 1;
+		if (g->first == i) {
+			derech_status field_error = DERECH_OK;
+			uint32_t field_goal = is_set ? 0 :
+				q->goal_y * map->w + q->goal_x;
+			uint32_t field_set = is_set ? q->goalset :
+				DERECH_NO_GOALSET;
+
 			/* set queries are always field-backed — they exist to
 			 * be reused; single goals need a crowd to justify it */
 			if (is_set || g->count >= map->field_threshold) {
-				g->field = derech_field_cache_insert(map,
-					is_set ? 0 : q->goal_y * map->w +
-						q->goal_x,
-					is_set ? q->goalset :
-						DERECH_NO_GOALSET,
-					q->profile_id);
-				if (g->field != NULL) {
+				g->field = derech_field_cache_lookup(map, field_goal,
+					field_set, q->profile_id);
+				if (g->field == NULL) {
+					g->field = derech_field_cache_insert(map,
+						field_goal, field_set, q->profile_id,
+						&field_error);
+				}
+				if (g->field == NULL &&
+					field_error == DERECH_E_RESOURCE_LIMIT &&
+					(n1 != 0 || n2 != 0)) {
+					rc = execute_wave(map, t1, &n1, t2, &n2,
+						reqs, stage);
+					if (rc != DERECH_OK) {
+						goto done;
+					}
+					g->field = derech_field_cache_lookup(map,
+						field_goal, field_set, q->profile_id);
+					if (g->field == NULL) {
+						g->field = derech_field_cache_insert(map,
+							field_goal, field_set, q->profile_id,
+							&field_error);
+					}
+				}
+				if (g->field != NULL && !g->field->ok) {
 					t1[n1].kind = DERECH_TASK_FIELD_BUILD;
 					t1[n1].req_idx = 0;
 					t1[n1].field = g->field;
 					n1++;
+				} else if (is_set) {
+					g->error = field_error;
+				}
+			}
+
+			for (uint32_t member = g->first; member != UINT32_MAX;
+				member = next[member]) {
+				if ((member & 255u) == 0 && derech_cancelled(map)) {
+					rc = DERECH_E_CANCELLED;
+					goto done;
+				}
+				if (g->field != NULL) {
+					t2[n2].kind = DERECH_TASK_EXTRACT;
+					t2[n2].req_idx = member;
+					t2[n2].field = g->field;
+					n2++;
+				} else if (is_set) {
+					stage[member].error = g->error == DERECH_OK ?
+						DERECH_E_NOMEM : g->error;
+				} else {
+					/* Field insertion failure leaves single goals on
+					 * the classic A* path. */
+					t1[n1].kind = DERECH_TASK_SOLVE;
+					t1[n1].req_idx = member;
+					t1[n1].field = NULL;
+					n1++;
 				}
 			}
 		}
-		if (g->field != NULL) {
-			t2[n2].kind = DERECH_TASK_EXTRACT;
-			t2[n2].req_idx = i;
-			t2[n2].field = g->field;
-			n2++;
-		} else if (is_set) {
-			/* shell allocation failed: sets have no per-request
-			 * fallback search */
-			stage[i].oom = 1;
-		} else {
-			/* insert failure just leaves the group on the classic
-			 * A* path */
-			t1[n1].kind = DERECH_TASK_SOLVE;
-			t1[n1].req_idx = i;
-			t1[n1].field = NULL;
-			n1++;
-		}
 	}
 
-	run_tasks(map, t1, n1, reqs, stage);
-	run_tasks(map, t2, n2, reqs, stage);
-	derech_field_cache_finish_batch(map);
-	rc = DERECH_OK;
+	rc = execute_wave(map, t1, &n1, t2, &n2, reqs, stage);
 done:
 	free(t1);
 	free(t2);
 	free(action);
+	free(next);
 	free(groups);
 	return rc;
 }
 
-derech_status derech_find_paths(derech_map *map, const derech_request *reqs,
-	uint32_t n_reqs, derech_results **out)
+derech_status derech_find_paths_ex(derech_map *map,
+	const derech_request *reqs, uint32_t n_reqs,
+	const derech_find_opts *opts, derech_results **out)
 {
 	derech_results *r;
 	derech_stage_row *stage = NULL;
 	derech_status rc;
 
-	if (map == NULL || out == NULL || (reqs == NULL && n_reqs > 0)) {
+	if (map == NULL || out == NULL || (reqs == NULL && n_reqs > 0) ||
+		(opts != NULL && (opts->struct_size != sizeof(*opts) ||
+			opts->reserved0 != 0))) {
 		return DERECH_E_INVALID_ARG;
 	}
 	*out = NULL;
 	if (!derech_busy_acquire(&map->busy)) {
 		return DERECH_E_BUSY;
 	}
+	map->active_cancel = opts == NULL ? NULL : opts->cancel;
+	if (derech_cancelled(map)) {
+		map->active_cancel = NULL;
+		derech_busy_release(&map->busy);
+		return DERECH_E_CANCELLED;
+	}
 	rc = validate_requests(map, reqs, n_reqs);
 	if (rc != DERECH_OK) {
+		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		return rc;
 	}
 
 	r = calloc(1, sizeof(*r));
 	if (r == NULL) {
+		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		return DERECH_E_NOMEM;
 	}
 	r->count = n_reqs;
 	if (n_reqs == 0) {
+		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		*out = r;
 		return DERECH_OK;
+	}
+	if ((size_t)n_reqs > SIZE_MAX / sizeof(*r->rows) ||
+		(size_t)n_reqs > SIZE_MAX / sizeof(*stage)) {
+		map->active_cancel = NULL;
+		derech_busy_release(&map->busy);
+		derech_results_destroy(r);
+		return DERECH_E_NOMEM;
 	}
 
 	r->rows = calloc(n_reqs, sizeof(*r->rows));
 	stage = calloc(n_reqs, sizeof(*stage));
 	if (r->rows == NULL || stage == NULL) {
 		free(stage);
+		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
 		return DERECH_E_NOMEM;
@@ -594,13 +785,25 @@ derech_status derech_find_paths(derech_map *map, const derech_request *reqs,
 	rc = plan_and_execute(map, reqs, n_reqs, stage);
 	if (rc != DERECH_OK) {
 		free(stage);
+		derech_field_cache_finish_batch(map, 0);
+		derech_labels_finish_call(map, 0);
+		derech_contexts_trim(map);
+		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
 		return rc;
 	}
 
-	rc = assemble_results(map, stage, n_reqs, r);
+	if (derech_cancelled(map)) {
+		rc = DERECH_E_CANCELLED;
+	} else {
+		rc = assemble_results(map, stage, n_reqs, r);
+	}
 	free(stage);
+	derech_field_cache_finish_batch(map, rc == DERECH_OK);
+	derech_labels_finish_call(map, rc == DERECH_OK);
+	derech_contexts_trim(map);
+	map->active_cancel = NULL;
 	derech_busy_release(&map->busy);
 	if (rc != DERECH_OK) {
 		derech_results_destroy(r);
@@ -608,6 +811,12 @@ derech_status derech_find_paths(derech_map *map, const derech_request *reqs,
 	}
 	*out = r;
 	return DERECH_OK;
+}
+
+derech_status derech_find_paths(derech_map *map, const derech_request *reqs,
+	uint32_t n_reqs, derech_results **out)
+{
+	return derech_find_paths_ex(map, reqs, n_reqs, NULL, out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,6 +896,22 @@ float derech_result_total_perceived(const derech_results *results, uint32_t i)
 	const derech_res_row *row = row_at(results, i);
 
 	return row == NULL ? 0.0f : row->total_perceived;
+}
+
+uint64_t derech_result_total_ticks_q8(const derech_results *results,
+	uint32_t i)
+{
+	const derech_res_row *row = row_at(results, i);
+
+	return row == NULL ? 0 : row->total_ticks_q8;
+}
+
+uint64_t derech_result_total_perceived_q8(const derech_results *results,
+	uint32_t i)
+{
+	const derech_res_row *row = row_at(results, i);
+
+	return row == NULL ? 0 : row->total_perceived_q8;
 }
 
 uint32_t derech_result_expansions(const derech_results *results, uint32_t i)

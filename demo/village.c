@@ -568,6 +568,7 @@ static void sim_tick(uint64_t tick)
 			npc *n = &npcs[queue[k]];
 
 			memset(&reqs[k], 0, sizeof(reqs[k]));
+			reqs[k].struct_size = sizeof(reqs[k]);
 			reqs[k].start_x = n->x;
 			reqs[k].start_y = n->y;
 			reqs[k].goal_x = n->target.gx;

@@ -36,8 +36,11 @@ static int heap_push(derech_search_ctx *ctx, uint64_t *len,
 	uint64_t i = *len;
 
 	if (i == ctx->heap_cap) {
-		uint64_t cap = ctx->heap_cap * 2;
+		uint64_t cap = ctx->heap_cap == 0 ? 4096 : ctx->heap_cap * 2;
 
+		if (cap <= ctx->heap_cap || cap > SIZE_MAX / sizeof(*h)) {
+			return 0;
+		}
 		h = realloc(ctx->heap, (size_t)cap * sizeof(*h));
 		if (h == NULL) {
 			return 0;
@@ -151,7 +154,7 @@ static int corner_forbidden(const derech_map *map,
 
 void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
-	uint32_t eps_q, uint32_t max_expansions, uint32_t max_cost_q,
+	uint32_t eps_q, uint32_t max_expansions, uint64_t max_cost_q,
 	derech_search_result *out)
 {
 	const uint32_t w = map->w;
@@ -161,10 +164,16 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	uint64_t heap_len = 0;
 	uint32_t expansions = 0;
 	uint64_t best_h;
-	uint32_t best_g;
+	uint64_t best_g;
 	uint32_t best_idx = start_idx;
 	int cost_pruned = 0;
 	derech_heap_entry e;
+
+	out->error = DERECH_OK;
+	if (derech_cancelled(map)) {
+		out->error = DERECH_E_CANCELLED;
+		return;
+	}
 
 	/* O(1) context reset; wrap resets the stamps for real */
 	ctx->stamp_gen++;
@@ -178,13 +187,11 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	best_h = heuristic_q(prof, start_idx % w, start_idx / w, gx, gy);
 	best_g = 0;
 
-	e.f = derech_sat_u32(((uint64_t)eps_q * best_h) >> 8);
+	e.f = ((uint64_t)eps_q * best_h) >> 8;
 	e.g = 0;
 	e.idx = start_idx;
 	if (!heap_push(ctx, &heap_len, e)) {
-		out->status = DERECH_PATH_UNREACHABLE;
-		out->end_idx = start_idx;
-		out->expansions = 0;
+		out->error = DERECH_E_NOMEM;
 		return;
 	}
 
@@ -198,6 +205,10 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 		cur = e.idx;
 		if (e.g != ctx->g[cur]) {
 			continue; /* stale duplicate */
+		}
+		if ((expansions & 255u) == 0 && derech_cancelled(map)) {
+			out->error = DERECH_E_CANCELLED;
+			return;
 		}
 		if (cur == goal_idx) {
 			out->status = DERECH_PATH_FOUND;
@@ -226,8 +237,7 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 			int64_t nx = (int64_t)x + derech_dir_dx[d];
 			int64_t ny = (int64_t)y + derech_dir_dy[d];
 			uint32_t nb, step_q;
-			uint64_t ng64;
-			uint32_t ng;
+			uint64_t ng;
 			derech_heap_entry ne;
 
 			if (nx < 0 || ny < 0 || nx >= (int64_t)w ||
@@ -242,12 +252,11 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 				continue;
 			}
 			step_q = derech_perceived_step_q(map, prof, nb, d >= 4);
-			ng64 = (uint64_t)e.g + step_q;
-			if (ng64 > max_cost_q) {
+			ng = e.g + step_q;
+			if (ng > max_cost_q) {
 				cost_pruned = 1;
 				continue;
 			}
-			ng = (uint32_t)ng64;
 			touch(ctx, nb);
 			if (ng >= ctx->g[nb]) {
 				continue;
@@ -256,15 +265,11 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 			ctx->parent[nb] = (uint8_t)(d + 1);
 			ne.g = ng;
 			ne.idx = nb;
-			ne.f = derech_sat_u32(ng + (((uint64_t)eps_q *
+			ne.f = ng + (((uint64_t)eps_q *
 				heuristic_q(prof, (uint32_t)nx, (uint32_t)ny,
-					gx, gy)) >> 8));
+					gx, gy)) >> 8);
 			if (!heap_push(ctx, &heap_len, ne)) {
-				/* allocation failure mid-search: report the
-				 * best partial rather than lying */
-				out->status = DERECH_PATH_BUDGET_EXCEEDED;
-				out->end_idx = best_idx;
-				out->expansions = expansions;
+				out->error = DERECH_E_NOMEM;
 				return;
 			}
 		}

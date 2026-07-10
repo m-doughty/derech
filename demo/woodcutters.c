@@ -426,6 +426,7 @@ static void sim_tick(uint64_t tick)
 				queue[nq].next_state = ST_TO_CAMP;
 				queue[nq].frontier_set = 0;
 				memset(&reqs[nq], 0, sizeof(reqs[nq]));
+				reqs[nq].struct_size = sizeof(reqs[nq]);
 				reqs[nq].start_x = n->x;
 				reqs[nq].start_y = n->y;
 				reqs[nq].goal_x = CAMP_X;
@@ -441,6 +442,7 @@ static void sim_tick(uint64_t tick)
 			queue[nq].next_state = ST_TO_TREE;
 			queue[nq].frontier_set = 0;
 			memset(&reqs[nq], 0, sizeof(reqs[nq]));
+			reqs[nq].struct_size = sizeof(reqs[nq]);
 			reqs[nq].start_x = n->x;
 			reqs[nq].start_y = n->y;
 			reqs[nq].goalset = (uint32_t)set_known_trees;
@@ -550,6 +552,7 @@ static void sim_tick(uint64_t tick)
 			continue;
 		}
 		memset(&q, 0, sizeof(q));
+		q.struct_size = sizeof(q);
 		q.start_x = n->x;
 		q.start_y = n->y;
 		q.goalset = (uint32_t)sid;

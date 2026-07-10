@@ -125,6 +125,7 @@ static void fill_scatter(derech_request *q, uint32_t flags)
 	rng_s = 0xACE5;
 	for (uint32_t i = 0; i < NREQ; i++) {
 		memset(&q[i], 0, sizeof(q[i]));
+		q[i].struct_size = sizeof(q[i]);
 		q[i].start_x = (uint32_t)(rng_next() % W);
 		q[i].start_y = (uint32_t)(rng_next() % H);
 		q[i].goal_x = (uint32_t)(rng_next() % W);

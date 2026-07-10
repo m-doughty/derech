@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(derech
-	VERSION 0.4.0
+	VERSION 0.5.0
 	DESCRIPTION "Batch pathfinding over weighted tile grids"
 	LANGUAGES C)
 
@@ -11,6 +11,7 @@ option(DERECH_FUZZ "Build the libFuzzer harness (requires Clang)" OFF)
 option(DERECH_WERROR "Treat warnings as errors" OFF)
 option(DERECH_SANITIZE "Build with AddressSanitizer + UBSanitizer" OFF)
 option(DERECH_TSAN "Build with ThreadSanitizer" OFF)
+option(DERECH_BUILD_DEMO_SELFTESTS "Build headless demo self-tests" OFF)
 
 if(DERECH_SANITIZE AND DERECH_TSAN)
 	message(FATAL_ERROR "DERECH_SANITIZE and DERECH_TSAN are mutually exclusive")
@@ -21,13 +22,25 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_library(derech
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+set(DERECH_ABI_VERSION 1)
+set(DERECH_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+file(MAKE_DIRECTORY "${DERECH_GENERATED_INCLUDE_DIR}")
+configure_file(cmake/derech_version.h.in
+	"${DERECH_GENERATED_INCLUDE_DIR}/derech_version.h" @ONLY)
+
+set(DERECH_SOURCES
+	src/alloc.c
 	src/map.c
 	src/profile.c
 	src/search.c
 	src/batch.c
 	src/pool.c
 	src/field.c)
+add_library(derech ${DERECH_SOURCES})
+add_library(derech::derech ALIAS derech)
 
 if(NOT WIN32)
 	set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -37,13 +50,17 @@ endif()
 
 target_include_directories(derech PUBLIC
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-	$<INSTALL_INTERFACE:include>)
+	$<BUILD_INTERFACE:${DERECH_GENERATED_INCLUDE_DIR}>
+	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 set_target_properties(derech PROPERTIES
 	C_STANDARD 17
 	C_STANDARD_REQUIRED ON
 	C_EXTENSIONS OFF
-	C_VISIBILITY_PRESET hidden)
+	C_VISIBILITY_PRESET hidden
+	EXPORT_NAME derech
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${DERECH_ABI_VERSION})
 
 target_compile_definitions(derech PRIVATE DERECH_BUILD)
 if(NOT BUILD_SHARED_LIBS)
@@ -80,12 +97,52 @@ if(DERECH_TSAN)
 	target_link_options(derech PUBLIC -fsanitize=thread)
 endif()
 
-include(GNUInstallDirs)
 install(TARGETS derech
+	EXPORT derechTargets
 	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES include/derech.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES
+	include/derech.h
+	"${DERECH_GENERATED_INCLUDE_DIR}/derech_version.h"
+	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+set(DERECH_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/derech")
+configure_package_config_file(cmake/derechConfig.cmake.in
+	"${CMAKE_CURRENT_BINARY_DIR}/derechConfig.cmake"
+	INSTALL_DESTINATION "${DERECH_INSTALL_CMAKEDIR}")
+write_basic_package_version_file(
+	"${CMAKE_CURRENT_BINARY_DIR}/derechConfigVersion.cmake"
+	VERSION ${PROJECT_VERSION}
+	COMPATIBILITY SameMinorVersion)
+install(EXPORT derechTargets
+	FILE derechTargets.cmake
+	NAMESPACE derech::
+	DESTINATION "${DERECH_INSTALL_CMAKEDIR}")
+install(FILES
+	"${CMAKE_CURRENT_BINARY_DIR}/derechConfig.cmake"
+	"${CMAKE_CURRENT_BINARY_DIR}/derechConfigVersion.cmake"
+	DESTINATION "${DERECH_INSTALL_CMAKEDIR}")
+
+file(RELATIVE_PATH DERECH_PC_PREFIX_REL
+	"${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+	"${CMAKE_INSTALL_PREFIX}")
+if(BUILD_SHARED_LIBS)
+	set(DERECH_PC_PRIVATE_LIBS "")
+	set(DERECH_PC_COMPILE_DEFINITIONS "")
+else()
+	set(DERECH_PC_COMPILE_DEFINITIONS " -DDERECH_STATIC")
+	if(WIN32)
+		set(DERECH_PC_PRIVATE_LIBS "")
+	else()
+		set(DERECH_PC_PRIVATE_LIBS " -pthread")
+	endif()
+endif()
+configure_file(cmake/derech.pc.in "${CMAKE_CURRENT_BINARY_DIR}/derech.pc" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/derech.pc"
+	DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+install(FILES README.md CHANGELOG.md LICENSE ABI.md INSTALL.md RELEASING.md
+	DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
 if(DERECH_BUILD_TESTS)
 	enable_testing()
@@ -103,7 +160,9 @@ if(DERECH_BUILD_TESTS)
 		C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 	target_compile_options(derech_test_support PRIVATE ${DERECH_C_WARNINGS})
 
-	foreach(t map profile search batch field goalset property)
+	set(DERECH_TEST_NAMES map profile search batch field goalset property abi
+		concurrency extreme resource)
+	foreach(t IN LISTS DERECH_TEST_NAMES)
 		add_executable(test_${t} tests/test_${t}.c)
 		target_link_libraries(test_${t} PRIVATE derech_test_support)
 		set_target_properties(test_${t} PROPERTIES
@@ -111,6 +170,81 @@ if(DERECH_BUILD_TESTS)
 		target_compile_options(test_${t} PRIVATE ${DERECH_C_WARNINGS})
 		add_test(NAME ${t} COMMAND test_${t})
 	endforeach()
+
+	# Fault injection is compiled into a private object-library copy so the
+	# installed derech target remains production-identical when tests are on.
+	add_library(derech_oom_core OBJECT ${DERECH_SOURCES})
+	target_include_directories(derech_oom_core PUBLIC
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+		${DERECH_GENERATED_INCLUDE_DIR})
+	target_compile_definitions(derech_oom_core PRIVATE
+		DERECH_BUILD DERECH_STATIC DERECH_TESTING)
+	set_target_properties(derech_oom_core PROPERTIES
+		C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+		C_VISIBILITY_PRESET hidden)
+	target_compile_options(derech_oom_core PRIVATE ${DERECH_C_WARNINGS})
+	if(NOT WIN32)
+		target_link_libraries(derech_oom_core PUBLIC Threads::Threads)
+	endif()
+
+	add_executable(test_oom tests/test_oom.c tests/support.c)
+	target_link_libraries(test_oom PRIVATE derech_oom_core)
+	target_include_directories(test_oom PRIVATE tests src)
+	target_compile_definitions(test_oom PRIVATE DERECH_STATIC DERECH_TESTING)
+	set_target_properties(test_oom PROPERTIES
+		C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+	target_compile_options(test_oom PRIVATE ${DERECH_C_WARNINGS})
+	if(NOT WIN32)
+		target_link_libraries(test_oom PRIVATE m)
+	endif()
+	if(DERECH_SANITIZE)
+		target_compile_options(derech_oom_core PRIVATE
+			-fsanitize=address,undefined -fno-sanitize-recover=all)
+		target_compile_options(test_oom PRIVATE
+			-fsanitize=address,undefined -fno-sanitize-recover=all)
+		target_link_options(test_oom PRIVATE -fsanitize=address,undefined)
+	elseif(DERECH_TSAN)
+		target_compile_options(derech_oom_core PRIVATE -fsanitize=thread)
+		target_compile_options(test_oom PRIVATE -fsanitize=thread)
+		target_link_options(test_oom PRIVATE -fsanitize=thread)
+	endif()
+	add_test(NAME oom COMMAND test_oom)
+
+	configure_file(cmake/VerifyInstall.cmake.in
+		"${CMAKE_CURRENT_BINARY_DIR}/VerifyInstall.cmake" @ONLY)
+	add_test(NAME install_consumer COMMAND ${CMAKE_COMMAND}
+		-DERECH_TEST_CONFIG=$<CONFIG>
+		-P "${CMAKE_CURRENT_BINARY_DIR}/VerifyInstall.cmake")
+	add_test(NAME version_consistency COMMAND ${CMAKE_COMMAND}
+		-DDERECH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+		-DDERECH_EXPECTED_VERSION=${PROJECT_VERSION}
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckReleaseVersion.cmake")
+	if(BUILD_SHARED_LIBS AND UNIX)
+		add_test(NAME exported_symbols COMMAND ${CMAKE_COMMAND}
+			-DDERECH_LIBRARY=$<TARGET_FILE:derech>
+			-DDERECH_NM=${CMAKE_NM}
+			-DDERECH_APPLE=${APPLE}
+			-DDERECH_ALLOWLIST=${CMAKE_CURRENT_SOURCE_DIR}/cmake/derech.exports
+			-P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckExports.cmake")
+		if(APPLE)
+			set(_derech_expected_file "libderech.${PROJECT_VERSION}.dylib")
+			set(_derech_expected_soname
+				"libderech.${DERECH_ABI_VERSION}.dylib")
+		else()
+			set(_derech_expected_file
+				"${CMAKE_SHARED_LIBRARY_PREFIX}derech${CMAKE_SHARED_LIBRARY_SUFFIX}.${PROJECT_VERSION}")
+			set(_derech_expected_soname
+				"${CMAKE_SHARED_LIBRARY_PREFIX}derech${CMAKE_SHARED_LIBRARY_SUFFIX}.${DERECH_ABI_VERSION}")
+		endif()
+		add_test(NAME shared_library_identity COMMAND ${CMAKE_COMMAND}
+			-DDERECH_FILE=$<TARGET_FILE:derech>
+			-DDERECH_FILE_NAME=$<TARGET_FILE_NAME:derech>
+			-DDERECH_EXPECTED_FILE_NAME=${_derech_expected_file}
+			-DDERECH_SONAME_FILE=$<TARGET_SONAME_FILE:derech>
+			-DDERECH_SONAME_FILE_NAME=$<TARGET_SONAME_FILE_NAME:derech>
+			-DDERECH_EXPECTED_SONAME_FILE_NAME=${_derech_expected_soname}
+			-P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckSharedIdentity.cmake")
+	endif()
 endif()
 
 if(DERECH_BUILD_BENCH)
@@ -124,6 +258,23 @@ if(DERECH_BUILD_BENCH)
 endif()
 
 option(DERECH_BUILD_DEMO "Build the notcurses demos" OFF)
+
+if(DERECH_BUILD_DEMO_SELFTESTS)
+	enable_testing()
+	foreach(demo village woodcutters)
+		add_executable(derech_${demo}_selftest demo/${demo}.c)
+		target_link_libraries(derech_${demo}_selftest PRIVATE derech)
+		target_compile_definitions(derech_${demo}_selftest PRIVATE
+			DEMO_SELFTEST_ONLY)
+		set_target_properties(derech_${demo}_selftest PROPERTIES
+			C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+		target_compile_options(derech_${demo}_selftest PRIVATE
+			${DERECH_C_WARNINGS})
+		add_test(NAME demo_${demo}_selftest
+			COMMAND derech_${demo}_selftest --selftest)
+	endforeach()
+endif()
+
 if(DERECH_BUILD_DEMO)
 	find_package(PkgConfig QUIET)
 	if(PKG_CONFIG_FOUND)

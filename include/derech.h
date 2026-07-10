@@ -20,8 +20,8 @@
  *
  * Cost model
  * ----------
- * Costs are quantized to Q8.8 fixed point internally (1/256 tick
- * resolution); all search arithmetic is integer, so results are
+ * Costs use integer fixed point with eight fractional bits internally
+ * (1/256 tick resolution); all search arithmetic is integer, so results are
  * bitwise-deterministic across platforms for identical inputs and library
  * versions.  Do not build with -ffast-math or equivalents.
  *
@@ -36,6 +36,9 @@
  *     over the tile's tag bits:  mult = product of tag_mult[b] over set
  *     bits, add = sum of tag_add[b] over set bits (flat penalties are NOT
  *     scaled by the diagonal multiplier — you enter the tile once).
+ *   Folded mult_q and add_q are rounded to 1/256 and capped at 2^28.
+ *   The final perceived entry cost is capped at
+ *   DERECH_MAX_STEP_COST_Q8 before it is added to a cumulative cost.
  *
  * The search minimizes PERCEIVED cost (route choice), but reported step
  * durations are TRUE ticks (base cost including the diagonal multiplier,
@@ -63,10 +66,12 @@
  *
  * Threading contract
  * ------------------
- * Distinct maps are fully independent.  On one map, at most one API call
- * may be active at a time: a second concurrent call (mutation or query)
- * fails fast with DERECH_E_BUSY rather than racing.  Results objects are
- * independent of the map and may be read from any thread.
+ * Distinct maps are fully independent.  On one map, at most one stateful
+ * call may be active at a time: a second mutation, path query, terrain
+ * read-back, goal-set count, or memory-stat call fails fast with
+ * DERECH_E_BUSY rather than racing.  Immutable dimensions/thread count and
+ * the atomic generation/profile-count snapshots may be read concurrently.
+ * Results objects are independent of the map and may be read from any thread.
  *
  * Batches are solved in parallel on an internal worker pool owned by the
  * map (derech_map_opts.n_threads; default: one worker per CPU core,
@@ -74,8 +79,9 @@
  * guarantee: the results object is bitwise-identical for any thread
  * count, because each request's search is fully self-contained and the
  * results arena is assembled in request order.  Each worker keeps a
- * search context of roughly 13 bytes per map tile (allocated lazily by
- * the OS as pages are touched) — size n_threads accordingly on big maps.
+ * search context with roughly 13 bytes of fixed state per map tile plus
+ * reusable heap/output buffers.  Contexts are allocated only as a batch
+ * needs them; automatic thread selection honors worker_memory_mb.
  *
  * Batch acceleration
  * ------------------
@@ -138,6 +144,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <derech_version.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -160,13 +168,13 @@ extern "C" {
 #define DERECH_API
 #endif
 
-#define DERECH_VERSION_MAJOR 0
-#define DERECH_VERSION_MINOR 4
-#define DERECH_VERSION_PATCH 0
-
 /* Returns (major << 16) | (minor << 8) | patch. */
 DERECH_API uint32_t derech_version(void);
 DERECH_API const char *derech_version_str(void);
+
+/* Binary interface epoch.  Bindings should reject an unsupported epoch
+ * before making any call that exchanges a public struct. */
+DERECH_API uint32_t derech_abi_version(void);
 
 /* ------------------------------------------------------------------ */
 /* Limits & constants                                                  */
@@ -179,6 +187,8 @@ DERECH_API const char *derech_version_str(void);
 #define DERECH_MAX_GOALSETS 64u      /* registered goal sets per map    */
 #define DERECH_NO_GOALSET 0u         /* request.goalset: single goal    */
 #define DERECH_DEFAULT_EPSILON 1.25f /* used when request.epsilon == 0  */
+#define DERECH_MAX_STEP_COST_Q8 UINT32_MAX /* 2^24 ticks minus 1/256    */
+#define DERECH_MAX_PATH_TICKS 70368744177664.0f /* 2^46 ticks             */
 
 /* ------------------------------------------------------------------ */
 /* Status codes                                                        */
@@ -199,7 +209,9 @@ enum {
 	                                      tag words on one map            */
 	DERECH_E_TOO_MANY_PROFILES = -7,   /* > DERECH_MAX_PROFILES            */
 	DERECH_E_BAD_GOALSET = -8,         /* unknown goal-set id in a request */
-	DERECH_E_TOO_MANY_GOALSETS = -9    /* > DERECH_MAX_GOALSETS            */
+	DERECH_E_TOO_MANY_GOALSETS = -9,   /* > DERECH_MAX_GOALSETS            */
+	DERECH_E_RESOURCE_LIMIT = -10,     /* configured memory limit          */
+	DERECH_E_CANCELLED = -11           /* cooperative cancellation         */
 };
 
 DERECH_API const char *derech_status_str(derech_status s);
@@ -236,21 +248,37 @@ typedef struct derech_map_opts {
 	                               threads spawned), 0 = auto (one per
 	                               CPU core, capped at 16), explicit
 	                               values up to DERECH_MAX_THREADS       */
-	uint32_t field_cache_mb;    /* goal-field cache budget in MiB; 0 =
-	                               default (64), max 4096.  Soft: may be
-	                               exceeded within a single batch.      */
+	uint32_t field_cache_mb;    /* retained goal-field cache in MiB; 0 =
+	                               default (64), max 4096                */
 	uint32_t field_group_threshold; /* same-(goal, profile) requests per
 	                               batch needed to build a shared field;
 	                               0 = default (4), 1 = always          */
+	uint32_t worker_memory_mb; /* hard fixed worker-state budget; 0 = 256 MiB
+	                            for auto threads, unlimited for an
+	                            explicit n_threads value                */
+	uint32_t field_working_mb; /* hard resident-field working limit; 0 =
+	                            retained cache plus one full field.
+	                            Tighter values reduce effective cache
+	                            retention to reserve replacement space */
+	uint32_t scratch_retention_mb; /* retained heap/path-output capacity
+	                                per worker; 0 = default (16 MiB)    */
+	uint32_t label_cache_mb; /* connected-component label cache; 0 =
+	                          default (64 MiB), always at least one map */
+	uint32_t reserved0;      /* must be zero; occupies ABI tail padding */
 } derech_map_opts;
 
 /* Create a map of width x height tiles (each 1..DERECH_MAX_DIM).
  * opts may be NULL: passability 1.0, tags 0, auto threads, default
- * field cache.  Older derech_map_opts layouts (16-byte v0.1, 24-byte
- * v0.2) are still accepted via their struct_size.  Returns NULL on
- * invalid arguments or allocation failure. */
+ * field cache.  Older derech_map_opts layouts are accepted via struct_size:
+ * 16-byte v0.1, 20/24-byte v0.2, and 28/32-byte v0.3/v0.4 (the size varies
+ * with the legacy platform ABI).  Returns NULL on invalid arguments or
+ * allocation failure. */
 DERECH_API derech_map *derech_map_create(uint32_t width, uint32_t height,
 	const derech_map_opts *opts);
+
+/* Status-returning constructor.  On failure *out is NULL. */
+DERECH_API derech_status derech_map_create_ex(uint32_t width, uint32_t height,
+	const derech_map_opts *opts, derech_map **out);
 
 /* Destroy a map.  NULL is a no-op.  The caller must ensure no other call
  * on this map is in flight. */
@@ -261,6 +289,31 @@ DERECH_API uint32_t derech_map_height(const derech_map *map);
 
 /* Effective batch parallelism (resolved from n_threads / auto). */
 DERECH_API uint32_t derech_map_thread_count(const derech_map *map);
+
+typedef struct derech_memory_stats {
+	uint32_t struct_size;          /* = sizeof(derech_memory_stats)       */
+	uint32_t configured_threads;
+	uint32_t allocated_contexts;
+	uint32_t reserved0;
+	uint64_t terrain_bytes;
+	uint64_t worker_bytes;
+	uint64_t field_bytes;
+	uint64_t field_peak_bytes;
+	uint64_t field_cache_bytes;   /* configured retention ceiling          */
+	uint64_t field_working_bytes;
+	uint64_t label_bytes;
+	uint64_t label_cache_bytes;
+	uint64_t retained_scratch_bytes;
+} derech_memory_stats;
+
+/* Estimate fixed terrain/worker/field limits without creating a map. */
+DERECH_API derech_status derech_map_memory_estimate(uint32_t width,
+	uint32_t height, const derech_map_opts *opts, derech_memory_stats *out);
+
+/* Snapshot current allocations.  Returns DERECH_E_BUSY during another
+ * stateful call on the map. */
+DERECH_API derech_status derech_map_get_memory_stats(const derech_map *map,
+	derech_memory_stats *out);
 
 /* ------------------------------------------------------------------ */
 /* Goal sets                                                           */
@@ -299,15 +352,12 @@ DERECH_API int64_t derech_goalset_count(derech_map *map, uint32_t id);
  * Useful for host-side caching keyed on map state. */
 DERECH_API uint64_t derech_map_generation(const derech_map *map);
 
-/* Terrain setters.  All are validate-then-commit: on any error the map is
- * completely unchanged (and the generation counter does not move).
+/* Terrain setters are validate-then-commit: on error, tile state and the
+ * generation counter are unchanged.  An allocation grown while validating a
+ * tag update may be retained for reuse, but uncommitted tag words disappear.
  * Passability values must satisfy 0 <= p <= 1 (NaN/inf rejected).
  * Full-grid variants require count == width * height, row-major
- * (index = y * width + x).  Rect variants read a row-major w*h buffer.
- *
- * Exception to atomicity, tags only: interning may permanently learn new
- * tag words even when the call later fails with
- * DERECH_E_TAG_COMBOS_EXHAUSTED — tile state is still untouched. */
+ * (index = y * width + x).  Rect variants read a row-major w*h buffer. */
 DERECH_API derech_status derech_map_set_passability(derech_map *map,
 	const float *p, uint64_t count);
 DERECH_API derech_status derech_map_set_passability_rect(derech_map *map,
@@ -372,14 +422,19 @@ typedef struct derech_profile_desc {
 	uint8_t reserved0;    /* must be 0                     */
 	uint8_t reserved1;    /* must be 0                     */
 	float diagonal_mult;
+	uint32_t reserved2;   /* must be 0; occupies ABI padding */
 	uint64_t block_mask;
 	uint64_t require_mask;
 	float tag_mult[64];
 	float tag_add[64];
+	uint32_t reserved3;   /* must be 0                     */
+	uint32_t reserved4;   /* must be 0                     */
 } derech_profile_desc;
 
 /* Register a profile; returns its id (>= 0) or a negative derech_status.
- * Profiles are immutable once registered and live as long as the map. */
+ * Profiles are immutable once registered and live as long as the map.
+ * Historical 540-byte (32-bit) and 544-byte (64-bit) descriptors are
+ * normalized to the current layout. */
 DERECH_API int32_t derech_profile_register(derech_map *map,
 	const derech_profile_desc *desc);
 
@@ -394,19 +449,35 @@ enum {
 };
 
 typedef struct derech_request {
+	uint32_t struct_size;         /* = sizeof(derech_request), fixed at 64 */
 	uint32_t start_x, start_y;
 	uint32_t goal_x, goal_y;   /* ignored when goalset != DERECH_NO_GOALSET */
 	uint32_t profile_id;
 	uint32_t flags;            /* DERECH_REQ_*                             */
 	uint32_t max_expansions;   /* settled-node budget; 0 = whole map       */
-	float max_perceived_cost;  /* ticks, <= 16000000; 0 = unlimited        */
+	float max_perceived_cost;  /* ticks, <= DERECH_MAX_PATH_TICKS;
+	                            0 = unlimited                              */
 	float epsilon;             /* in [1, 256], or 0 for DEFAULT_EPSILON    */
 	uint32_t goalset;          /* goal-set id, or DERECH_NO_GOALSET (0)
 	                              for an ordinary single-goal request.
 	                              ALLOW_PARTIAL is invalid with a set.    */
+	uint32_t reserved[5];      /* must be zero; reserved within ABI 1     */
 } derech_request;
 
 typedef struct derech_results derech_results;
+typedef struct derech_cancel derech_cancel;
+
+typedef struct derech_find_opts {
+	uint32_t struct_size;       /* = sizeof(derech_find_opts) */
+	uint32_t reserved0;         /* must be zero               */
+	const derech_cancel *cancel;
+} derech_find_opts;
+
+/* A token may be requested from another thread while find_paths_ex is
+ * running.  The caller must keep it alive until that call returns. */
+DERECH_API derech_status derech_cancel_create(derech_cancel **out);
+DERECH_API void derech_cancel_request(derech_cancel *cancel);
+DERECH_API void derech_cancel_destroy(derech_cancel *cancel);
 
 /* Solve a batch of 0..n requests.  Request coordinates that are out of
  * bounds yield DERECH_PATH_INVALID_ENDPOINT for that request only; an
@@ -418,6 +489,10 @@ typedef struct derech_results derech_results;
  * derech_results_destroy().  reqs may be NULL when n_reqs == 0. */
 DERECH_API derech_status derech_find_paths(derech_map *map,
 	const derech_request *reqs, uint32_t n_reqs, derech_results **out);
+
+DERECH_API derech_status derech_find_paths_ex(derech_map *map,
+	const derech_request *reqs, uint32_t n_reqs,
+	const derech_find_opts *opts, derech_results **out);
 
 DERECH_API void derech_results_destroy(derech_results *results);
 
@@ -438,8 +513,9 @@ DERECH_API const uint32_t *derech_result_steps(const derech_results *results,
 
 /* TRUE tick duration of each step (base terrain cost incl. diagonal
  * multiplier, excluding preference weights).  length floats, NULL when
- * length is 0.  The authoritative total is derech_result_total_ticks
- * (computed in integer Q8; summing these floats may differ by rounding). */
+ * length is 0.  The authoritative total is
+ * derech_result_total_ticks_q8(); summing these floats may differ by
+ * rounding. */
 DERECH_API const float *derech_result_step_ticks(
 	const derech_results *results, uint32_t i);
 
@@ -447,6 +523,13 @@ DERECH_API float derech_result_total_ticks(const derech_results *results,
 	uint32_t i);
 DERECH_API float derech_result_total_perceived(const derech_results *results,
 	uint32_t i);
+
+/* Exact totals in fixed point with eight fractional bits.  These are
+ * authoritative where a float cannot preserve 1/256-tick precision. */
+DERECH_API uint64_t derech_result_total_ticks_q8(
+	const derech_results *results, uint32_t i);
+DERECH_API uint64_t derech_result_total_perceived_q8(
+	const derech_results *results, uint32_t i);
 
 /* Settled-node count of the search that produced result i (diagnostics /
  * budget tuning).  0 for requests resolved without searching. */

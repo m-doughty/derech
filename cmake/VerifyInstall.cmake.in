@@ -1,0 +1,68 @@
+set(_root "@CMAKE_CURRENT_BINARY_DIR@/install-consumer")
+set(_stage "${_root}/stage")
+set(_relocated "${_root}/relocated")
+set(_consumer_build "${_root}/build")
+if("@BUILD_SHARED_LIBS@")
+	set(_expect_static OFF)
+else()
+	set(_expect_static ON)
+endif()
+
+file(LOCK "@CMAKE_CURRENT_BINARY_DIR@/install-consumer.lock"
+	GUARD PROCESS TIMEOUT 300 RESULT_VARIABLE _lock_result)
+if(NOT _lock_result STREQUAL "0")
+	message(FATAL_ERROR "could not lock installed-consumer test: ${_lock_result}")
+endif()
+
+file(REMOVE_RECURSE "${_root}")
+
+set(_install_command "@CMAKE_COMMAND@" --install
+	"@CMAKE_CURRENT_BINARY_DIR@" --prefix "${_stage}")
+if(NOT "${DERECH_TEST_CONFIG}" STREQUAL "")
+	list(APPEND _install_command --config "${DERECH_TEST_CONFIG}")
+endif()
+execute_process(COMMAND ${_install_command} RESULT_VARIABLE _result)
+if(NOT _result EQUAL 0)
+	message(FATAL_ERROR "derech staging install failed: ${_result}")
+endif()
+
+file(RENAME "${_stage}" "${_relocated}")
+
+set(_configure_command "@CMAKE_COMMAND@"
+	-S "@CMAKE_CURRENT_SOURCE_DIR@/cmake/tests/consumer"
+	-B "${_consumer_build}"
+	-G "@CMAKE_GENERATOR@"
+	-DCMAKE_PREFIX_PATH=${_relocated}
+	-DDERECH_EXPECT_STATIC=${_expect_static})
+if(NOT "@CMAKE_GENERATOR_PLATFORM@" STREQUAL "")
+	list(APPEND _configure_command -A "@CMAKE_GENERATOR_PLATFORM@")
+endif()
+if(NOT "@CMAKE_GENERATOR_TOOLSET@" STREQUAL "")
+	list(APPEND _configure_command -T "@CMAKE_GENERATOR_TOOLSET@")
+endif()
+if("@CMAKE_CONFIGURATION_TYPES@" STREQUAL "")
+	list(APPEND _configure_command -DCMAKE_BUILD_TYPE=@CMAKE_BUILD_TYPE@)
+endif()
+execute_process(COMMAND ${_configure_command} RESULT_VARIABLE _result)
+if(NOT _result EQUAL 0)
+	message(FATAL_ERROR "derech consumer configure failed: ${_result}")
+endif()
+
+set(_build_command "@CMAKE_COMMAND@" --build "${_consumer_build}")
+if(NOT "${DERECH_TEST_CONFIG}" STREQUAL "")
+	list(APPEND _build_command --config "${DERECH_TEST_CONFIG}")
+endif()
+execute_process(COMMAND ${_build_command} RESULT_VARIABLE _result)
+if(NOT _result EQUAL 0)
+	message(FATAL_ERROR "derech consumer build failed: ${_result}")
+endif()
+
+set(_ctest_command "@CMAKE_CTEST_COMMAND@" --test-dir "${_consumer_build}"
+	--output-on-failure)
+if(NOT "${DERECH_TEST_CONFIG}" STREQUAL "")
+	list(APPEND _ctest_command -C "${DERECH_TEST_CONFIG}")
+endif()
+execute_process(COMMAND ${_ctest_command} RESULT_VARIABLE _result)
+if(NOT _result EQUAL 0)
+	message(FATAL_ERROR "derech installed consumer tests failed: ${_result}")
+endif()

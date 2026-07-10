@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+- No changes yet.
+
+## 0.5.0 — 2026-07-09
+
+- Cumulative true and perceived costs now use 64-bit fixed-point arithmetic
+  with eight fractional bits across A*, goal fields, staging, and result
+  assembly. Cached and uncached searches agree above the old 32-bit ceiling.
+  New exact
+  `derech_result_total_ticks_q8` and
+  `derech_result_total_perceived_q8` accessors avoid float precision loss.
+- The per-map concurrency contract is race-free and remains nonblocking:
+  overlapping stateful calls fail with `DERECH_E_BUSY`, immutable metadata is
+  lock-free, and mutable metadata uses guarded or atomic snapshots.
+- Required allocation failures propagate as `DERECH_E_NOMEM`; failed batches
+  do not commit partial cache or predicate-goal membership state, and failed
+  tag setters roll back newly interned words. `derech_map_create_ex` adds a
+  status-returning constructor while the original constructor remains as a
+  compatibility wrapper. Allocation fault-injection tests cover search,
+  fields, staging, assembly, and construction.
+- Worker contexts are allocated on demand and no longer retain a full-map path
+  scratch array. Worker, field-working, component-label, and retained-scratch
+  memory have explicit limits. Field groups are processed in deterministic
+  waves, optional single-goal fields can fall back to A*, and required goal-set
+  fields report `DERECH_E_RESOURCE_LIMIT` when they cannot fit. New estimate
+  and live-memory statistics APIs expose the effective limits and allocations.
+- Explicit goal sets report their deduplicated member count. Duplicate input
+  coordinates remain accepted and ignored.
+- ABI epoch 1 freezes `derech_request` at 64 bytes with `struct_size` first and
+  reserved zero-required fields. `DERECH_ABI_VERSION` and
+  `derech_abi_version()` let bindings reject an unsupported native ABI.
+  The current profile descriptor names former padding, while known 540-byte
+  and 544-byte historical layouts remain accepted. Cooperative cancellation
+  is available through `derech_cancel` and `derech_find_paths_ex`.
+- CMake is the source of the `0.5.0` version header. Installations export the
+  relocatable `derech::derech` target, CMake config/version files, pkg-config
+  metadata, documentation, and shared-library soname epoch 1. CI builds C and
+  C++ consumers from a relocated installation, checks static pkg-config use,
+  and exercises shared loading on Linux, macOS, and Windows.
+- Sanitizer CI now runs headless village and woodcutter self-tests. Nightly
+  fuzzing publishes corpus growth on a dedicated pull-request branch instead
+  of pushing directly to the primary branch.
+- `ABI.md`, `INSTALL.md`, and `RELEASING.md` define the integration and release
+  contracts. The gated tag workflow rebuilds and tests six static/shared
+  platform packages, emits SHA-256 checksums and provenance attestations, and
+  creates a draft release unless publication is explicitly approved.
+
 ## 0.4.0 — 2026-07-05
 
 - **Goal sets**: requests may target a set of tiles via
@@ -101,7 +149,7 @@ Library (M4):
 
 ## 0.1.0 — 2026-07-04
 
-- Initial release: weighted tile grids (passability → Q8.8 entry cost),
+- Initial release: weighted tile grids (entry costs with eight fractional bits),
   64-bit tag words interned per map, NPC profiles (per-tag multipliers
   and flat penalties, block/require masks, 4/8-connectivity, diagonal
   multiplier, corner rules), batched weighted A* (per-request epsilon,

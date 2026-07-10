@@ -236,6 +236,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 					1.25f, 2.0f, 0.5f /* invalid */ };
 
 				memset(&q[k], 0, sizeof(q[k]));
+				q[k].struct_size = sizeof(q[k]);
 				q[k].start_x = r8(&r) % (w + 2);
 				q[k].start_y = r8(&r) % (h + 2);
 				q[k].goal_x = r8(&r) % (w + 2);

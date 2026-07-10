@@ -41,11 +41,17 @@ static void test_register_validation(void)
 		DERECH_E_INVALID_ARG);
 	T_CHECK(derech_goalset_register(m, xy, 0, 0) ==
 		DERECH_E_INVALID_ARG);
+	T_CHECK(derech_goalset_register(m, xy, 65, 0) ==
+		DERECH_E_INVALID_ARG);
 	T_CHECK(derech_goalset_register(m, xy, 2, 0) == DERECH_E_OOB);
 	T_CHECK(derech_goalset_register(m, xy, 1, 0x4) ==
 		DERECH_E_INVALID_ARG);
 	T_CHECK(derech_goalset_register_tags(m, 0, 0, 0) ==
 		DERECH_E_INVALID_ARG);
+	T_CHECK(derech_busy_acquire(&m->busy));
+	T_CHECK(derech_goalset_register(m, xy, 1, 0) == DERECH_E_BUSY);
+	T_CHECK(derech_goalset_register_tags(m, 1, 0, 0) == DERECH_E_BUSY);
+	derech_busy_release(&m->busy);
 
 	T_CHECK(derech_goalset_unregister(m, 0) == DERECH_E_BAD_GOALSET);
 	T_CHECK(derech_goalset_unregister(m, 1) == DERECH_E_BAD_GOALSET);
@@ -461,6 +467,51 @@ static void test_dirty_overflow_fallback(void)
 	derech_map_destroy(m);
 }
 
+static void test_new_field_is_most_recent(void)
+{
+	enum { SIDE = 256 };
+	derech_map_opts opts;
+	derech_map *m;
+	derech_profile_desc d = t_neutral_desc();
+	uint32_t a_xy[2] = { SIDE - 1, SIDE - 1 };
+	uint32_t b_xy[2] = { SIDE - 1, 0 };
+	derech_request first;
+	derech_request batch[2];
+	derech_results *res;
+	int32_t a_id, b_id;
+
+	memset(&opts, 0, sizeof(opts));
+	opts.struct_size = (uint32_t)sizeof(opts);
+	opts.default_passability = 1.0f;
+	opts.n_threads = 1;
+	opts.field_cache_mb = 1; /* one 256x256 field fits, two do not */
+	m = derech_map_create(SIDE, SIDE, &opts);
+	T_CHECK(m != NULL);
+	if (m == NULL) {
+		return;
+	}
+	T_CHECK(derech_profile_register(m, &d) == 0);
+	a_id = derech_goalset_register(m, a_xy, 1, 0);
+	b_id = derech_goalset_register(m, b_xy, 1, 0);
+	T_CHECK(a_id == 1);
+	T_CHECK(b_id == 2);
+	first = set_req(0, 0, (uint32_t)a_id);
+	res = run_batch(m, &first, 1);
+	derech_results_destroy(res);
+	T_CHECK(cached_field_count(m) == 1);
+	T_CHECK(m->field_lru_head->goalset_id == (uint32_t)a_id);
+
+	/* The old field is hit before the new one is inserted.  Commit order
+	 * must still leave the later-created field as the retained MRU. */
+	batch[0] = first;
+	batch[1] = set_req(0, SIDE - 1, (uint32_t)b_id);
+	res = run_batch(m, batch, 2);
+	derech_results_destroy(res);
+	T_CHECK(cached_field_count(m) == 1);
+	T_CHECK(m->field_lru_head->goalset_id == (uint32_t)b_id);
+	derech_map_destroy(m);
+}
+
 static void test_labels_relevance(void)
 {
 	/* labels survive tag edits outside their masks, flush on
@@ -603,6 +654,7 @@ int main(void)
 	test_dirty_tag_relevance();
 	test_dirty_adjacent_unblock();
 	test_dirty_overflow_fallback();
+	test_new_field_is_most_recent();
 	test_labels_relevance();
 	test_set_history_determinism();
 	return t_done("test_goalset");

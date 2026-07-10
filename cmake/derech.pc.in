@@ -1,0 +1,12 @@
+prefix=${pcfiledir}/@DERECH_PC_PREFIX_REL@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: derech
+Description: @PROJECT_DESCRIPTION@
+Version: @PROJECT_VERSION@
+URL: https://github.com/m-doughty/derech
+Libs: -L${libdir} -lderech
+Libs.private:@DERECH_PC_PRIVATE_LIBS@
+Cflags: -I${includedir}@DERECH_PC_COMPILE_DEFINITIONS@

@@ -31,6 +31,7 @@ typedef struct derech_batch_job {
 	derech_map *map;
 	const derech_task *tasks;
 	uint32_t n_tasks;
+	uint32_t n_participants;
 	const derech_request *reqs;
 	derech_stage_row *stage;
 } derech_batch_job;
@@ -43,6 +44,9 @@ struct derech_pool {
 	derech_thread *threads;
 	derech_worker_arg *args;
 	uint32_t n_spawned;
+	int m_initialized;
+	int work_cv_initialized;
+	int done_cv_initialized;
 	int shutdown;      /* guarded by m */
 	uint64_t seq;      /* guarded by m; bumped per dispatched batch */
 	derech_batch_job job; /* guarded by m for writes; workers copy   */
@@ -92,7 +96,7 @@ static void pool_worker(void *argp)
 		}
 		seen = p->seq;
 		job = p->job;
-		if (job.n_tasks == 0) {
+		if (job.n_tasks == 0 || wa->index >= job.n_participants) {
 			continue; /* batch already completed without us */
 		}
 		p->n_active++;
@@ -111,13 +115,14 @@ static void pool_worker(void *argp)
 
 void derech_pool_run(derech_pool *p, derech_map *map,
 	const derech_task *tasks, uint32_t n_tasks, const derech_request *reqs,
-	derech_stage_row *stage)
+	derech_stage_row *stage, uint32_t n_participants)
 {
 	derech_batch_job job;
 
 	job.map = map;
 	job.tasks = tasks;
 	job.n_tasks = n_tasks;
+	job.n_participants = n_participants;
 	job.reqs = reqs;
 	job.stage = stage;
 
@@ -153,9 +158,21 @@ derech_pool *derech_pool_create(uint32_t n_workers)
 	if (p == NULL) {
 		return NULL;
 	}
-	derech_mutex_init(&p->m);
-	derech_cond_init(&p->work_cv);
-	derech_cond_init(&p->done_cv);
+	if (!derech_mutex_init(&p->m)) {
+		free(p);
+		return NULL;
+	}
+	p->m_initialized = 1;
+	if (!derech_cond_init(&p->work_cv)) {
+		derech_pool_destroy(p);
+		return NULL;
+	}
+	p->work_cv_initialized = 1;
+	if (!derech_cond_init(&p->done_cv)) {
+		derech_pool_destroy(p);
+		return NULL;
+	}
+	p->done_cv_initialized = 1;
 	p->threads = calloc(n_workers - 1, sizeof(*p->threads));
 	p->args = calloc(n_workers - 1, sizeof(*p->args));
 	if (p->threads == NULL || p->args == NULL) {
@@ -189,9 +206,15 @@ void derech_pool_destroy(derech_pool *p)
 			derech_thread_join(p->threads[i]);
 		}
 	}
-	derech_mutex_destroy(&p->m);
-	derech_cond_destroy(&p->work_cv);
-	derech_cond_destroy(&p->done_cv);
+	if (p->done_cv_initialized) {
+		derech_cond_destroy(&p->done_cv);
+	}
+	if (p->work_cv_initialized) {
+		derech_cond_destroy(&p->work_cv);
+	}
+	if (p->m_initialized) {
+		derech_mutex_destroy(&p->m);
+	}
 	free(p->threads);
 	free(p->args);
 	free(p);

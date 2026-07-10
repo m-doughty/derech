@@ -2,15 +2,12 @@
 #
 # Progress lives in the corpus: every run resumes from the accumulated
 # coverage frontier instead of rediscovering it.  Three layers keep it:
-#   - fuzz/corpus/ (committed)  — durable seed, survives everything;
+#   - fuzz/corpus/ (reviewed)   — durable seed, survives everything;
 #   - the Actions cache         — warm layer between nightlies (evicts
-#                                 after ~7 idle days, hence the commit);
-#   - the corpus-growth commit  — only happens when coverage actually
-#                                 moved, and doubles as repo activity so
-#                                 GitHub's 60-day inactivity rule doesn't
-#                                 disable this schedule while fuzzing is
-#                                 still finding things.
-# Set COMMIT_CORPUS to "false" to keep CI from pushing.
+#                                 after ~7 idle days);
+#   - a bot-owned pull request  — proposes corpus growth for review and
+#                                 never pushes directly to the primary branch.
+# Set PUBLISH_CORPUS_PR to "false" to keep CI from publishing a branch.
 
 name: nightly-fuzz
 
@@ -21,15 +18,32 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-fuzz-corpus
+  cancel-in-progress: false
 
 env:
-  COMMIT_CORPUS: "true"
+  PUBLISH_CORPUS_PR: "true"
+  CORPUS_BRANCH: automation/fuzz-corpus
 
 jobs:
   fuzz:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore pending reviewed-corpus branch
+        run: |
+          if git fetch origin \
+            "$CORPUS_BRANCH:refs/remotes/origin/$CORPUS_BRANCH"; then
+            git restore --source "origin/$CORPUS_BRANCH" --worktree -- \
+              fuzz/corpus
+          fi
+      - name: Snapshot reviewed corpus
+        run: cp -a fuzz/corpus baseline-corpus
       - name: Configure
         run: >
           cmake -B build -DDERECH_BUILD_TESTS=OFF -DDERECH_FUZZ=ON
@@ -44,7 +58,7 @@ jobs:
           path: work-corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
-      - name: Seed working corpus from the committed one
+      - name: Seed working corpus from the reviewed one
         run: |
           mkdir -p work-corpus
           cp -n fuzz/corpus/* work-corpus/ 2>/dev/null || true
@@ -53,7 +67,13 @@ jobs:
           ./build/fuzz_derech -fork=3 -ignore_crashes=1 \
             -max_total_time=2700 -print_final_stats=1 \
             -artifact_prefix=crash- work-corpus || true
-      - name: Merge new coverage into the committed corpus
+      - name: Fail on crashes
+        run: |
+          if ls crash-* >/dev/null 2>&1; then
+            echo "fuzzer found crashes"
+            exit 1
+          fi
+      - name: Merge new coverage into the reviewed corpus
         run: ./build/fuzz_derech -merge=1 fuzz/corpus work-corpus
       - name: Save working corpus
         uses: actions/cache/save@v4
@@ -61,22 +81,27 @@ jobs:
         with:
           path: work-corpus
           key: fuzz-corpus-${{ github.run_id }}
-      - name: Commit corpus growth
-        if: env.COMMIT_CORPUS == 'true'
+      - name: Publish corpus growth branch and pull request
+        if: env.PUBLISH_CORPUS_PR == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          if [ -n "$(git status --porcelain fuzz/corpus)" ]; then
+          if ! diff -qr baseline-corpus fuzz/corpus >/dev/null; then
             git config user.name "github-actions[bot]"
             git config user.email \
               "github-actions[bot]@users.noreply.github.com"
+            git switch -C "$CORPUS_BRANCH"
             git add fuzz/corpus
             git commit -m "fuzz: nightly corpus update"
-            git push
-          fi
-      - name: Fail on crashes
-        run: |
-          if ls crash-* >/dev/null 2>&1; then
-            echo "fuzzer found crashes"
-            exit 1
+            git push --force-with-lease origin "HEAD:$CORPUS_BRANCH"
+            if [ "$(gh pr list --head "$CORPUS_BRANCH" --state open \
+              --json number --jq 'length')" = "0" ]; then
+              gh pr create --base "$DEFAULT_BRANCH" \
+                --head "$CORPUS_BRANCH" \
+                --title "fuzz: nightly corpus update" \
+                --body "Automated libFuzzer corpus growth for review."
+            fi
           fi
       - name: Upload crash artifacts
         if: failure()

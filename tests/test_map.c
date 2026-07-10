@@ -222,14 +222,17 @@ static void test_tags_exhaustion(void)
 	/* tile state untouched by the failed bulk set */
 	T_CHECK(derech_map_get_tags_at(m, 150, 150, &v) == DERECH_OK);
 	T_CHECK(v == 0);
-	T_CHECK(derech_map_generation(m) == 0);
+	T_CHECK(derech_map_generation(m) == 1); /* profile registration */
 
-	/* already-interned words still usable; genuinely new ones are not */
+	/* Failed bulk interning rolls back, so both old and new words remain
+	 * usable by later successful calls. */
 	T_CHECK(derech_map_set_tags_at(m, 0, 0, 42) == DERECH_OK);
 	T_CHECK(derech_map_get_tags_at(m, 0, 0, &v) == DERECH_OK);
 	T_CHECK(v == 42);
 	T_CHECK(derech_map_set_tags_at(m, 0, 0, 0xABCDEF0123456789ULL) ==
-		DERECH_E_TAG_COMBOS_EXHAUSTED);
+		DERECH_OK);
+	T_CHECK(derech_map_get_tags_at(m, 0, 0, &v) == DERECH_OK);
+	T_CHECK(v == 0xABCDEF0123456789ULL);
 
 	free(buf);
 	derech_map_destroy(m);
@@ -326,16 +329,38 @@ static void test_threads_opts(void)
 	}
 	derech_map_destroy(m);
 
-	/* the 24-byte v0.2 layout reads n_threads but no field options */
-	memset(&o, 0, sizeof(o));
-	o.struct_size = 24;
-	o.default_passability = 1.0f;
-	o.n_threads = 2;
-	o.field_cache_mb = 99999; /* must be ignored at this struct_size */
-	m = derech_map_create(4, 4, &o);
-	T_CHECK(m != NULL);
-	T_CHECK(derech_map_thread_count(m) == 2);
-	derech_map_destroy(m);
+	/* v0.2 was 20 or 24 bytes depending on legacy uint64_t alignment. */
+	for (uint32_t size = 20; size <= 24; size += 4) {
+		memset(&o, 0, sizeof(o));
+		o.struct_size = size;
+		o.default_passability = 1.0f;
+		o.n_threads = 2;
+		o.field_cache_mb = 99999; /* ignored at this struct_size */
+		m = derech_map_create(4, 4, &o);
+		T_CHECK(m != NULL);
+		T_CHECK(derech_map_thread_count(m) == 2);
+		derech_map_destroy(m);
+	}
+
+	/* v0.3/v0.4 was likewise 28 or 32 bytes. */
+	for (uint32_t size = 28; size <= 32; size += 4) {
+		derech_memory_stats stats;
+
+		memset(&o, 0, sizeof(o));
+		o.struct_size = size;
+		o.default_passability = 1.0f;
+		o.n_threads = 1;
+		o.field_cache_mb = 2;
+		o.field_group_threshold = 7;
+		o.worker_memory_mb = 99999; /* ignored at this struct_size */
+		m = derech_map_create(4, 4, &o);
+		T_CHECK(m != NULL);
+		memset(&stats, 0, sizeof(stats));
+		stats.struct_size = (uint32_t)sizeof(stats);
+		T_CHECK(derech_map_get_memory_stats(m, &stats) == DERECH_OK);
+		T_CHECK(stats.field_cache_bytes == 2u * 1024u * 1024u);
+		derech_map_destroy(m);
+	}
 
 	/* current layout validates the field options */
 	memset(&o, 0, sizeof(o));
@@ -350,8 +375,9 @@ static void test_threads_opts(void)
 
 static void test_version(void)
 {
-	T_CHECK(derech_version() == ((0u << 16) | (4u << 8) | 0u));
-	T_CHECK(strcmp(derech_version_str(), "0.4.0") == 0);
+	T_CHECK(derech_version() == ((0u << 16) | (5u << 8) | 0u));
+	T_CHECK(strcmp(derech_version_str(), "0.5.0") == 0);
+	T_CHECK(derech_abi_version() == DERECH_ABI_VERSION);
 	T_CHECK(strcmp(derech_status_str(DERECH_OK), "ok") == 0);
 	T_CHECK(strcmp(derech_status_str(-9999), "unknown status") == 0);
 	T_CHECK(strcmp(derech_path_status_str(DERECH_PATH_FOUND),

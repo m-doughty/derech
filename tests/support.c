@@ -278,6 +278,7 @@ derech_request t_req(uint32_t sx, uint32_t sy, uint32_t gx, uint32_t gy)
 	derech_request q;
 
 	memset(&q, 0, sizeof(q));
+	q.struct_size = sizeof(q);
 	q.start_x = sx;
 	q.start_y = sy;
 	q.goal_x = gx;

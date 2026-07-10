@@ -26,15 +26,18 @@ static const uint8_t DIR_OPPOSITE[8] = { 1, 0, 3, 2, 7, 6, 5, 4 };
 
 /* Reuses the ctx heap (entries carry f = g = dist for the total order). */
 static int field_heap_push(derech_search_ctx *ctx, uint64_t *len,
-	uint32_t dist, uint32_t idx)
+	uint64_t dist, uint32_t idx)
 {
 	derech_heap_entry *h;
 	derech_heap_entry e;
 	uint64_t i = *len;
 
 	if (i == ctx->heap_cap) {
-		uint64_t cap = ctx->heap_cap * 2;
+		uint64_t cap = ctx->heap_cap == 0 ? 4096 : ctx->heap_cap * 2;
 
+		if (cap <= ctx->heap_cap || cap > SIZE_MAX / sizeof(*h)) {
+			return 0;
+		}
 		h = realloc(ctx->heap, (size_t)cap * sizeof(*h));
 		if (h == NULL) {
 			return 0;
@@ -121,9 +124,20 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 	const uint32_t w = map->w;
 	const uint32_t n_dirs = prof->connectivity == DERECH_CONN_4 ? 4 : 8;
 	uint64_t heap_len = 0;
+	uint32_t settled = 0;
+
+	field->error = DERECH_OK;
+	if (derech_cancelled(map)) {
+		field->error = DERECH_E_CANCELLED;
+		return;
+	}
 
 	for (uint32_t i = 0; i < map->n; i++) {
 		field->dist_q[i] = DERECH_G_INFINITE;
+		if ((i & 4095u) == 0 && derech_cancelled(map)) {
+			field->error = DERECH_E_CANCELLED;
+			return;
+		}
 	}
 	memset(field->next_dir, 0, map->n);
 
@@ -135,12 +149,17 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 			&map->goalsets[field->goalset_id - 1];
 
 		for (uint32_t idx = 0; idx < map->n; idx++) {
+			if ((idx & 1023u) == 0 && derech_cancelled(map)) {
+				field->error = DERECH_E_CANCELLED;
+				return;
+			}
 			if (((gs->seeds[idx / 64] >> (idx % 64)) & 1) == 0) {
 				continue;
 			}
 			field->dist_q[idx] = 0;
 			if (!derech_tile_blocked(map, prof, idx) &&
 				!field_heap_push(ctx, &heap_len, 0, idx)) {
+				field->error = DERECH_E_NOMEM;
 				return; /* ok stays 0 */
 			}
 		}
@@ -153,6 +172,7 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 		}
 		field->dist_q[field->goal_idx] = 0;
 		if (!field_heap_push(ctx, &heap_len, 0, field->goal_idx)) {
+			field->error = DERECH_E_NOMEM;
 			return; /* ok stays 0; requests fall back to A* */
 		}
 	}
@@ -166,6 +186,10 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 		if (e.f != field->dist_q[u]) {
 			continue; /* stale duplicate */
 		}
+		if ((settled++ & 255u) == 0 && derech_cancelled(map)) {
+			field->error = DERECH_E_CANCELLED;
+			return;
+		}
 		x = u % w;
 		y = u / w;
 		perc_straight = derech_perceived_step_q(map, prof, u, 0);
@@ -175,8 +199,7 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 			int64_t vx = (int64_t)x + derech_dir_dx[d];
 			int64_t vy = (int64_t)y + derech_dir_dy[d];
 			uint32_t v, step_q;
-			uint64_t cand64;
-			uint32_t cand;
+			uint64_t cand;
 
 			if (vx < 0 || vy < 0 || vx >= (int64_t)w ||
 				vy >= (int64_t)map->h) {
@@ -188,12 +211,7 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 				continue;
 			}
 			step_q = d >= 4 ? perc_diag : perc_straight;
-			cand64 = (uint64_t)field->dist_q[u] + step_q;
-			if (cand64 >= DERECH_G_INFINITE) {
-				cand = DERECH_G_INFINITE - 1; /* saturate */
-			} else {
-				cand = (uint32_t)cand64;
-			}
+			cand = field->dist_q[u] + step_q;
 			if (cand >= field->dist_q[v]) {
 				continue;
 			}
@@ -205,6 +223,7 @@ void derech_field_build(const derech_map *map, derech_search_ctx *ctx,
 				continue;
 			}
 			if (!field_heap_push(ctx, &heap_len, cand, v)) {
+				field->error = DERECH_E_NOMEM;
 				return; /* ok stays 0 */
 			}
 		}
@@ -226,18 +245,13 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof = &map->profiles[field->profile_id];
 	int allow_partial = (req->flags & DERECH_REQ_ALLOW_PARTIAL) != 0;
 	uint32_t start_idx = req->start_y * map->w + req->start_x;
-	uint32_t dist;
-	uint32_t max_cost_q;
+	uint64_t dist;
+	uint64_t max_cost_q;
 
 	row->worker = worker;
 	if (!field->ok) {
-		/* build failure is an allocation failure; set queries have
-		 * no per-request search to fall back to */
-		if (req->goalset != DERECH_NO_GOALSET) {
-			row->oom = 1;
-			return;
-		}
-		derech_solve_request(map, ctx, worker, req, row);
+		row->error = field->error == DERECH_OK ? DERECH_E_NOMEM :
+			field->error;
 		return;
 	}
 	dist = field->dist_q[start_idx];
@@ -254,9 +268,9 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 		return;
 	}
 
-	max_cost_q = req->max_perceived_cost == 0.0f ? UINT32_MAX :
-		derech_q_round((double)req->max_perceived_cost * 256.0,
-			UINT32_MAX - 1);
+	max_cost_q = req->max_perceived_cost == 0.0f ? UINT64_MAX :
+		derech_q_round_u64((double)req->max_perceived_cost * 256.0,
+			UINT64_MAX - 1);
 	if (dist > max_cost_q) {
 		if (allow_partial && req->goalset == DERECH_NO_GOALSET) {
 			derech_solve_request(map, ctx, worker, req, row);
@@ -285,7 +299,12 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 			idx = (uint32_t)((int64_t)idx + offs[d]);
 			if (!derech_ctx_out_reserve(ctx, 1)) {
 				ctx->out_len -= depth;
-				row->oom = 1;
+				row->error = DERECH_E_NOMEM;
+				return;
+			}
+			if ((depth & 255u) == 0 && derech_cancelled(map)) {
+				ctx->out_len -= depth;
+				row->error = DERECH_E_CANCELLED;
 				return;
 			}
 			{
@@ -306,7 +325,7 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 			/* impossible unless the field is corrupt; be safe */
 			ctx->out_len -= depth;
 			if (req->goalset != DERECH_NO_GOALSET) {
-				row->oom = 1;
+				row->error = DERECH_E_NOMEM;
 				return;
 			}
 			derech_solve_request(map, ctx, worker, req, row);
@@ -399,12 +418,26 @@ void derech_field_cache_flush(derech_map *map)
 	}
 }
 
-/* Evict unpinned fields from the LRU tail until within budget. */
+static uint64_t field_storage_bytes(const derech_map *map)
+{
+	return sizeof(derech_field) + (uint64_t)map->n * 9;
+}
+
+/* Evict unpinned fields from the LRU tail until within the achievable
+ * retention budget.  Reserving one field of working space lets a later call
+ * build a replacement without discarding committed cache state first. */
 static void field_cache_trim(derech_map *map)
 {
 	derech_field *f = map->field_lru_tail;
+	uint64_t one_field = field_storage_bytes(map);
+	uint64_t retention = map->field_working_bytes > one_field ?
+		map->field_working_bytes - one_field : 0;
 
-	while (map->field_bytes > map->field_budget_bytes && f != NULL) {
+	if (retention > map->field_budget_bytes) {
+		retention = map->field_budget_bytes;
+	}
+
+	while (map->field_bytes > retention && f != NULL) {
 		derech_field *prev = f->lru_prev;
 
 		if (!f->pinned) {
@@ -412,6 +445,21 @@ static void field_cache_trim(derech_map *map)
 		}
 		f = prev;
 	}
+}
+
+static int field_cache_make_room(derech_map *map, uint64_t extra)
+{
+	derech_field *f = map->field_lru_tail;
+
+	while (map->field_bytes + extra > map->field_working_bytes && f != NULL) {
+		derech_field *prev = f->lru_prev;
+
+		if (!f->pinned && f->new_in_call) {
+			field_destroy(map, f);
+		}
+		f = prev;
+	}
+	return map->field_bytes + extra <= map->field_working_bytes;
 }
 
 derech_field *derech_field_cache_lookup(derech_map *map, uint32_t goal_idx,
@@ -423,9 +471,8 @@ derech_field *derech_field_cache_lookup(derech_map *map, uint32_t goal_idx,
 	while (f != NULL) {
 		if (f->goal_idx == goal_idx && f->goalset_id == goalset_id &&
 			f->profile_id == profile_id) {
-			field_lru_unlink(map, f);
-			field_lru_push_front(map, f);
 			f->pinned = 1;
+			f->touch_seq = ++map->field_touch_clock;
 			return f;
 		}
 		f = f->hash_next;
@@ -437,12 +484,21 @@ derech_field *derech_field_cache_lookup(derech_map *map, uint32_t goal_idx,
  * this batch to build.  Returns NULL on allocation failure — callers
  * then just leave the group on the classic A* path. */
 derech_field *derech_field_cache_insert(derech_map *map, uint32_t goal_idx,
-	uint32_t goalset_id, uint32_t profile_id)
+	uint32_t goalset_id, uint32_t profile_id, derech_status *error)
 {
-	derech_field *f = calloc(1, sizeof(*f));
+	derech_field *f;
+	uint64_t bytes = field_storage_bytes(map);
 	uint32_t b;
 
+	*error = DERECH_OK;
+	if (bytes > map->field_working_bytes ||
+		!field_cache_make_room(map, bytes)) {
+		*error = DERECH_E_RESOURCE_LIMIT;
+		return NULL;
+	}
+	f = calloc(1, sizeof(*f));
 	if (f == NULL) {
+		*error = DERECH_E_NOMEM;
 		return NULL;
 	}
 	f->goal_idx = goal_idx;
@@ -453,25 +509,30 @@ derech_field *derech_field_cache_insert(derech_map *map, uint32_t goal_idx,
 	f->profile_id = profile_id;
 	f->dist_q = malloc((size_t)map->n * sizeof(*f->dist_q));
 	f->next_dir = malloc(map->n);
-	f->bytes = sizeof(*f) + (uint64_t)map->n * 5;
+	f->bytes = bytes;
 	if (f->dist_q == NULL || f->next_dir == NULL) {
 		free(f->dist_q);
 		free(f->next_dir);
 		free(f);
+		*error = DERECH_E_NOMEM;
 		return NULL;
 	}
 	f->pinned = 1;
+	f->new_in_call = 1;
+	f->touch_seq = ++map->field_touch_clock;
 	b = field_hash(field_key(goal_idx, goalset_id), profile_id);
 	f->hash_next = map->field_hash[b];
 	map->field_hash[b] = f;
 	field_lru_push_front(map, f);
 	map->field_bytes += f->bytes;
-	field_cache_trim(map); /* never evicts pinned entries */
+	if (map->field_bytes > map->field_peak_bytes) {
+		map->field_peak_bytes = map->field_bytes;
+	}
 	return f;
 }
 
-/* Unpin everything, drop failed builds, and trim to budget. */
-void derech_field_cache_finish_batch(derech_map *map)
+/* Unpin everything built/used in one working-set wave. */
+void derech_field_cache_end_wave(derech_map *map)
 {
 	derech_field *f = map->field_lru_head;
 
@@ -484,6 +545,47 @@ void derech_field_cache_finish_batch(derech_map *map)
 		}
 		f = next;
 	}
+}
+
+/* Commit or roll back cache state for a completed public call. */
+void derech_field_cache_finish_batch(derech_map *map, int commit)
+{
+	derech_field *f;
+
+	derech_field_cache_end_wave(map);
+	if (!commit) {
+		f = map->field_lru_head;
+		while (f != NULL) {
+			derech_field *next = f->lru_next;
+
+			f->touch_seq = 0;
+			if (f->new_in_call) {
+				field_destroy(map, f);
+			}
+			f = next;
+		}
+		field_cache_trim(map);
+		return;
+	}
+
+	/* Apply deferred hit touches in access order. */
+	for (;;) {
+		derech_field *oldest = NULL;
+
+		for (f = map->field_lru_head; f != NULL; f = f->lru_next) {
+			f->new_in_call = 0;
+			if (f->touch_seq != 0 && (oldest == NULL ||
+				f->touch_seq < oldest->touch_seq)) {
+				oldest = f;
+			}
+		}
+		if (oldest == NULL) {
+			break;
+		}
+		oldest->touch_seq = 0;
+		field_lru_unlink(map, oldest);
+		field_lru_push_front(map, oldest);
+	}
 	field_cache_trim(map);
 }
 
@@ -491,12 +593,23 @@ void derech_field_cache_finish_batch(derech_map *map)
 /* Component labels (planning phase only)                              */
 /* ------------------------------------------------------------------ */
 
+static void label_remove(derech_map *map, uint32_t i)
+{
+	free(map->label_classes[i].label);
+	map->label_bytes -= (uint64_t)map->n * sizeof(uint32_t);
+	map->label_class_count--;
+	if (i != map->label_class_count) {
+		map->label_classes[i] = map->label_classes[map->label_class_count];
+	}
+	memset(&map->label_classes[map->label_class_count], 0,
+		sizeof(map->label_classes[0]));
+}
+
 void derech_labels_flush(derech_map *map)
 {
-	for (uint32_t i = 0; i < map->label_class_count; i++) {
-		free(map->label_classes[i].label);
+	while (map->label_class_count > 0) {
+		label_remove(map, map->label_class_count - 1);
 	}
-	map->label_class_count = 0;
 }
 
 /* Enterable for the blocking class, ignoring per-profile weights. */
@@ -515,25 +628,33 @@ static int class_enterable(const derech_map *map, uint64_t block_mask,
 	return require_mask == 0 || (word & require_mask) != 0;
 }
 
-/* Flood-fill labels over the superset graph (8-connected, corners
- * allowed).  Uses ctx 0's path_scratch as the BFS queue — only legal
- * during the single-threaded planning phase. */
+/* Flood-fill labels over the superset graph (8-connected, corners allowed). */
 static derech_labels *labels_build(derech_map *map, uint64_t block_mask,
 	uint64_t require_mask)
 {
 	derech_labels *lc = &map->label_classes[map->label_class_count];
-	uint32_t *queue = map->ctxs[0].path_scratch;
+	uint32_t *queue = malloc((size_t)map->n * sizeof(*queue));
 	uint32_t next_label = 0;
 
+	if (queue == NULL) {
+		return NULL;
+	}
 	lc->block_mask = block_mask;
 	lc->require_mask = require_mask;
 	lc->label = calloc(map->n, sizeof(*lc->label));
 	if (lc->label == NULL) {
+		free(queue);
 		return NULL;
 	}
 	for (uint32_t seed = 0; seed < map->n; seed++) {
 		uint64_t head = 0, tail = 0;
 
+		if ((seed & 1023u) == 0 && derech_cancelled(map)) {
+			free(queue);
+			free(lc->label);
+			memset(lc, 0, sizeof(*lc));
+			return NULL;
+		}
 		if (lc->label[seed] != 0 ||
 			!class_enterable(map, block_mask, require_mask, seed)) {
 			continue;
@@ -565,9 +686,19 @@ static derech_labels *labels_build(derech_map *map, uint64_t block_mask,
 				lc->label[nb] = next_label;
 				queue[tail++] = nb;
 			}
+			if ((head & 1023u) == 0 && derech_cancelled(map)) {
+				free(queue);
+				free(lc->label);
+				memset(lc, 0, sizeof(*lc));
+				return NULL;
+			}
 		}
 	}
+	free(queue);
+	lc->new_in_call = 1;
+	lc->touch_seq = ++map->label_touch_clock;
 	map->label_class_count++;
+	map->label_bytes += (uint64_t)map->n * sizeof(uint32_t);
 	return lc;
 }
 
@@ -581,13 +712,71 @@ const derech_labels *derech_labels_for(derech_map *map,
 		if (map->label_classes[i].block_mask == prof->block_mask &&
 			map->label_classes[i].require_mask ==
 				prof->require_mask) {
+			map->label_classes[i].touch_seq = ++map->label_touch_clock;
 			return &map->label_classes[i];
 		}
+	}
+	while (map->label_class_count < DERECH_MAX_LABEL_CLASSES &&
+		map->label_bytes + (uint64_t)map->n * sizeof(uint32_t) >
+			map->label_working_bytes) {
+		uint32_t oldest = UINT32_MAX;
+
+		for (uint32_t i = 0; i < map->label_class_count; i++) {
+			if (map->label_classes[i].new_in_call &&
+				(oldest == UINT32_MAX ||
+				map->label_classes[i].touch_seq <
+					map->label_classes[oldest].touch_seq)) {
+				oldest = i;
+			}
+		}
+		if (oldest == UINT32_MAX) {
+			return NULL;
+		}
+		label_remove(map, oldest);
 	}
 	if (map->label_class_count >= DERECH_MAX_LABEL_CLASSES) {
 		return NULL;
 	}
 	return labels_build(map, prof->block_mask, prof->require_mask);
+}
+
+void derech_labels_finish_call(derech_map *map, int commit)
+{
+	uint32_t i = 0;
+
+	if (!commit) {
+		while (i < map->label_class_count) {
+			map->label_classes[i].touch_seq = 0;
+			if (map->label_classes[i].new_in_call) {
+				label_remove(map, i);
+				continue;
+			}
+			i++;
+		}
+		return;
+	}
+
+	for (i = 0; i < map->label_class_count; i++) {
+		derech_labels *lc = &map->label_classes[i];
+
+		lc->new_in_call = 0;
+		if (lc->touch_seq != 0) {
+			lc->last_use = lc->touch_seq;
+			lc->touch_seq = 0;
+		}
+	}
+	while (map->label_bytes > map->label_budget_bytes &&
+		map->label_class_count > 0) {
+		uint32_t oldest = 0;
+
+		for (i = 1; i < map->label_class_count; i++) {
+			if (map->label_classes[i].last_use <
+				map->label_classes[oldest].last_use) {
+				oldest = i;
+			}
+		}
+		label_remove(map, oldest);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -639,104 +828,107 @@ static int goalset_tile_matches(const derech_map *map,
 	return (word & gs->all_mask) == gs->all_mask;
 }
 
-/* (Re)compute members + seeds from current map state.  Returns 0 on
- * allocation failure, 1 otherwise; *changed reports whether effective
- * membership differs from before. */
-int derech_goalset_materialize(derech_map *map, derech_goalset *gs)
+/* Compute members + seeds into fresh buffers, then publish them together.
+ * A cancelled or failed refresh must leave the previous membership intact. */
+derech_status derech_goalset_materialize(derech_map *map,
+	derech_goalset *gs)
 {
 	uint32_t words = (map->n + 63) / 64;
-	int changed = 0;
+	uint64_t *members = calloc(words, sizeof(*members));
+	uint64_t *seeds = calloc(words, sizeof(*seeds));
+	uint32_t count = 0;
+	int changed;
 
-	if (gs->members == NULL) {
-		gs->members = calloc(words, sizeof(uint64_t));
-		gs->seeds = calloc(words, sizeof(uint64_t));
-		if (gs->members == NULL || gs->seeds == NULL) {
-			return 0;
-		}
-		changed = 1;
+	if (members == NULL || seeds == NULL) {
+		free(members);
+		free(seeds);
+		return DERECH_E_NOMEM;
 	}
 
-	{
-		uint32_t count = 0;
+	if (gs->is_predicate) {
+		for (uint32_t w = 0; w < words; w++) {
+			uint32_t base = w * 64;
+			uint32_t top = base + 64 > map->n ?
+				map->n - base : 64;
 
-		if (gs->is_predicate) {
-			for (uint32_t w = 0; w < words; w++) {
-				uint64_t nw = 0;
-				uint32_t base = w * 64;
-				uint32_t top = base + 64 > map->n ?
-					map->n - base : 64;
-
-				for (uint32_t b = 0; b < top; b++) {
-					if (goalset_tile_matches(map, gs,
-						base + b)) {
-						nw |= 1ULL << b;
-					}
-				}
-				if (gs->members[w] != nw) {
-					changed = 1;
-					gs->members[w] = nw;
+			for (uint32_t b = 0; b < top; b++) {
+				if (goalset_tile_matches(map, gs, base + b)) {
+					members[w] |= 1ULL << b;
+					count++;
 				}
 			}
-			for (uint32_t i = 0; i < map->n; i++) {
-				count += (uint32_t)((gs->members[i / 64] >>
-					(i % 64)) & 1);
-			}
-		} else {
-			memset(gs->members, 0, (size_t)words *
-				sizeof(uint64_t));
-			for (uint32_t t = 0; t < gs->n_tiles; t++) {
-				uint32_t idx = gs->tiles[t * 2 + 1] * map->w +
-					gs->tiles[t * 2];
-
-				gs->members[idx / 64] |= 1ULL << (idx % 64);
-			}
-			for (uint32_t i = 0; i < map->n; i++) {
-				count += (uint32_t)((gs->members[i / 64] >>
-					(i % 64)) & 1);
+			if ((w & 255u) == 0 && derech_cancelled(map)) {
+				free(members);
+				free(seeds);
+				return DERECH_E_CANCELLED;
 			}
 		}
-		gs->member_count = count;
+	} else {
+		for (uint32_t t = 0; t < gs->n_tiles; t++) {
+			uint32_t idx = gs->tiles[t * 2 + 1] * map->w +
+				gs->tiles[t * 2];
+			uint64_t bit = 1ULL << (idx % 64);
+
+			if ((members[idx / 64] & bit) == 0) {
+				members[idx / 64] |= bit;
+				count++;
+			}
+			if ((t & 1023u) == 0 && derech_cancelled(map)) {
+				free(members);
+				free(seeds);
+				return DERECH_E_CANCELLED;
+			}
+		}
 	}
 
-	memset(gs->seeds, 0, (size_t)((map->n + 63) / 64) * sizeof(uint64_t));
 	for (uint32_t i = 0; i < map->n; i++) {
-		if ((gs->members[i / 64] >> (i % 64)) & 1) {
-			goalset_seed_tile(map, gs->seeds, i,
+		if ((members[i / 64] >> (i % 64)) & 1) {
+			goalset_seed_tile(map, seeds, i,
 				(gs->flags & DERECH_GOALSET_ADJACENT) != 0);
 		}
+		if ((i & 1023u) == 0 && derech_cancelled(map)) {
+			free(members);
+			free(seeds);
+			return DERECH_E_CANCELLED;
+		}
 	}
+
+	changed = gs->members == NULL || memcmp(gs->members, members,
+		(size_t)words * sizeof(*members)) != 0;
+	free(gs->members);
+	free(gs->seeds);
+	gs->members = members;
+	gs->seeds = seeds;
+	gs->member_count = count;
 	if (changed) {
 		gs->epoch++;
 	}
-	return 1;
+	return DERECH_OK;
 }
 
-static int32_t goalset_register_common(derech_map *map, derech_goalset tmp)
+/* Register while the caller owns map->busy. */
+static int32_t goalset_register_locked(derech_map *map, derech_goalset tmp)
 {
 	uint32_t slot;
+	derech_status rc;
 
-	if (!derech_busy_acquire(&map->busy)) {
-		free(tmp.tiles);
-		return DERECH_E_BUSY;
-	}
 	for (slot = 0; slot < DERECH_MAX_GOALSETS; slot++) {
 		if (!map->goalsets[slot].used) {
 			break;
 		}
 	}
 	if (slot == DERECH_MAX_GOALSETS) {
-		derech_busy_release(&map->busy);
 		free(tmp.tiles);
 		return DERECH_E_TOO_MANY_GOALSETS;
 	}
 	map->goalsets[slot] = tmp;
 	map->goalsets[slot].used = 1;
-	if (!derech_goalset_materialize(map, &map->goalsets[slot])) {
+	rc = derech_goalset_materialize(map, &map->goalsets[slot]);
+	if (rc != DERECH_OK) {
 		derech_goalset_free(&map->goalsets[slot]);
-		derech_busy_release(&map->busy);
-		return DERECH_E_NOMEM;
+		return rc;
 	}
-	derech_busy_release(&map->busy);
+	derech_atomic_fetch_add_u64(&map->generation, 1);
 	return (int32_t)slot + 1;
 }
 
@@ -746,11 +938,16 @@ int32_t derech_goalset_register(derech_map *map, const uint32_t *xy_pairs,
 	derech_goalset tmp;
 
 	if (map == NULL || xy_pairs == NULL || n_tiles == 0 ||
+		n_tiles > map->n ||
 		(flags & ~(uint32_t)DERECH_GOALSET_ADJACENT) != 0) {
 		return DERECH_E_INVALID_ARG;
 	}
+	if (!derech_busy_acquire(&map->busy)) {
+		return DERECH_E_BUSY;
+	}
 	for (uint32_t t = 0; t < n_tiles; t++) {
 		if (xy_pairs[t * 2] >= map->w || xy_pairs[t * 2 + 1] >= map->h) {
+			derech_busy_release(&map->busy);
 			return DERECH_E_OOB;
 		}
 	}
@@ -759,10 +956,16 @@ int32_t derech_goalset_register(derech_map *map, const uint32_t *xy_pairs,
 	tmp.n_tiles = n_tiles;
 	tmp.tiles = malloc((size_t)n_tiles * 2 * sizeof(*tmp.tiles));
 	if (tmp.tiles == NULL) {
+		derech_busy_release(&map->busy);
 		return DERECH_E_NOMEM;
 	}
 	memcpy(tmp.tiles, xy_pairs, (size_t)n_tiles * 2 * sizeof(*tmp.tiles));
-	return goalset_register_common(map, tmp);
+	{
+		int32_t id = goalset_register_locked(map, tmp);
+
+		derech_busy_release(&map->busy);
+		return id;
+	}
 }
 
 int32_t derech_goalset_register_tags(derech_map *map, uint64_t any_mask,
@@ -774,24 +977,35 @@ int32_t derech_goalset_register_tags(derech_map *map, uint64_t any_mask,
 		(flags & ~(uint32_t)DERECH_GOALSET_ADJACENT) != 0) {
 		return DERECH_E_INVALID_ARG;
 	}
+	if (!derech_busy_acquire(&map->busy)) {
+		return DERECH_E_BUSY;
+	}
 	memset(&tmp, 0, sizeof(tmp));
 	tmp.is_predicate = 1;
 	tmp.flags = flags;
 	tmp.any_mask = any_mask;
 	tmp.all_mask = all_mask;
-	return goalset_register_common(map, tmp);
+	{
+		int32_t id = goalset_register_locked(map, tmp);
+
+		derech_busy_release(&map->busy);
+		return id;
+	}
 }
 
 derech_status derech_goalset_unregister(derech_map *map, uint32_t id)
 {
 	derech_field *f;
 
-	if (map == NULL || id == 0 || id > DERECH_MAX_GOALSETS ||
-		!map->goalsets[id - 1].used) {
+	if (map == NULL || id == 0 || id > DERECH_MAX_GOALSETS) {
 		return DERECH_E_BAD_GOALSET;
 	}
 	if (!derech_busy_acquire(&map->busy)) {
 		return DERECH_E_BUSY;
+	}
+	if (!map->goalsets[id - 1].used) {
+		derech_busy_release(&map->busy);
+		return DERECH_E_BAD_GOALSET;
 	}
 	f = map->field_lru_head;
 	while (f != NULL) {
@@ -803,6 +1017,7 @@ derech_status derech_goalset_unregister(derech_map *map, uint32_t id)
 		f = next;
 	}
 	derech_goalset_free(&map->goalsets[id - 1]);
+	derech_atomic_fetch_add_u64(&map->generation, 1);
 	derech_busy_release(&map->busy);
 	return DERECH_OK;
 }
@@ -812,18 +1027,23 @@ int64_t derech_goalset_count(derech_map *map, uint32_t id)
 	derech_goalset *gs;
 	int64_t count = 0;
 
-	if (map == NULL || id == 0 || id > DERECH_MAX_GOALSETS ||
-		!map->goalsets[id - 1].used) {
+	if (map == NULL || id == 0 || id > DERECH_MAX_GOALSETS) {
 		return DERECH_E_BAD_GOALSET;
 	}
-	gs = &map->goalsets[id - 1];
-	if (!gs->is_predicate) {
-		return gs->n_tiles;
-	}
-	/* live scan: reflects all edits so far without mutating any state */
 	if (!derech_busy_acquire(&map->busy)) {
 		return DERECH_E_BUSY;
 	}
+	gs = &map->goalsets[id - 1];
+	if (!gs->used) {
+		derech_busy_release(&map->busy);
+		return DERECH_E_BAD_GOALSET;
+	}
+	if (!gs->is_predicate) {
+		count = gs->member_count;
+		derech_busy_release(&map->busy);
+		return count;
+	}
+	/* live scan: reflects all edits so far without mutating any state */
 	for (uint32_t i = 0; i < map->n; i++) {
 		count += goalset_tile_matches(map, gs, i);
 	}
@@ -862,18 +1082,21 @@ static int field_affected_by(const derech_map *map, const derech_field *f,
 				return 1;
 			}
 		}
+		if ((y & 255u) == 0 && derech_cancelled(map)) {
+			return 2;
+		}
 	}
 	return 0;
 }
 
-void derech_reconcile(derech_map *map)
+derech_status derech_reconcile(derech_map *map)
 {
 	derech_dirty *d = &map->dirty;
 	uint64_t all_bits = 0;
 	int any_pass = 0;
 
 	if (d->count == 0 && !d->full) {
-		return;
+		return DERECH_OK;
 	}
 	for (uint32_t r = 0; r < d->count; r++) {
 		all_bits |= d->rects[r].tag_bits;
@@ -890,9 +1113,11 @@ void derech_reconcile(derech_map *map)
 
 		if (gs->used && gs->is_predicate &&
 			(all_bits & (gs->any_mask | gs->all_mask)) != 0) {
-			/* allocation failure leaves the old membership in
-			 * place; epoch-based invalidation still guards it */
-			(void)derech_goalset_materialize(map, gs);
+			derech_status rc = derech_goalset_materialize(map, gs);
+
+			if (rc != DERECH_OK) {
+				return rc;
+			}
 		}
 	}
 
@@ -913,8 +1138,13 @@ void derech_reconcile(derech_map *map)
 				kill = 1;
 			} else {
 				for (uint32_t r = 0; r < d->count; r++) {
-					if (field_affected_by(map, f,
-						&d->rects[r])) {
+					int affected = field_affected_by(map, f,
+						&d->rects[r]);
+
+					if (affected == 2) {
+						return DERECH_E_CANCELLED;
+					}
+					if (affected != 0) {
 						kill = 1;
 						break;
 					}
@@ -937,10 +1167,7 @@ void derech_reconcile(derech_map *map)
 
 			if (any_pass || (all_bits &
 				(lc->block_mask | lc->require_mask)) != 0) {
-				free(lc->label);
-				map->label_class_count--;
-				*lc = map->label_classes[
-					map->label_class_count];
+				label_remove(map, i);
 				continue;
 			}
 			i++;
@@ -949,4 +1176,5 @@ void derech_reconcile(derech_map *map)
 
 	d->count = 0;
 	d->full = 0;
+	return DERECH_OK;
 }

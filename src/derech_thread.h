@@ -19,9 +19,10 @@ typedef HANDLE derech_thread;
 typedef SRWLOCK derech_mutex;
 typedef CONDITION_VARIABLE derech_cond;
 
-static inline void derech_mutex_init(derech_mutex *m)
+static inline int derech_mutex_init(derech_mutex *m)
 {
 	InitializeSRWLock(m);
+	return 1;
 }
 
 static inline void derech_mutex_destroy(derech_mutex *m)
@@ -39,9 +40,10 @@ static inline void derech_mutex_unlock(derech_mutex *m)
 	ReleaseSRWLockExclusive(m);
 }
 
-static inline void derech_cond_init(derech_cond *c)
+static inline int derech_cond_init(derech_cond *c)
 {
 	InitializeConditionVariable(c);
+	return 1;
 }
 
 static inline void derech_cond_destroy(derech_cond *c)
@@ -122,9 +124,9 @@ typedef pthread_t derech_thread;
 typedef pthread_mutex_t derech_mutex;
 typedef pthread_cond_t derech_cond;
 
-static inline void derech_mutex_init(derech_mutex *m)
+static inline int derech_mutex_init(derech_mutex *m)
 {
-	pthread_mutex_init(m, NULL);
+	return pthread_mutex_init(m, NULL) == 0;
 }
 
 static inline void derech_mutex_destroy(derech_mutex *m)
@@ -142,9 +144,9 @@ static inline void derech_mutex_unlock(derech_mutex *m)
 	pthread_mutex_unlock(m);
 }
 
-static inline void derech_cond_init(derech_cond *c)
+static inline int derech_cond_init(derech_cond *c)
 {
-	pthread_cond_init(c, NULL);
+	return pthread_cond_init(c, NULL) == 0;
 }
 
 static inline void derech_cond_destroy(derech_cond *c)
