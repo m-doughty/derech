@@ -154,7 +154,7 @@ static int corner_forbidden(const derech_map *map,
 
 void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
-	uint32_t eps_q, uint32_t max_expansions, uint64_t max_cost_q,
+	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
 	derech_search_result *out)
 {
 	const uint32_t w = map->w;
@@ -162,7 +162,7 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const uint32_t gy = goal_idx / w;
 	const uint32_t n_dirs = prof->connectivity == DERECH_CONN_4 ? 4 : 8;
 	uint64_t heap_len = 0;
-	uint32_t expansions = 0;
+	uint64_t expansions = 0;
 	uint64_t best_h;
 	uint64_t best_g;
 	uint32_t best_idx = start_idx;
@@ -213,13 +213,13 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 		if (cur == goal_idx) {
 			out->status = DERECH_PATH_FOUND;
 			out->end_idx = goal_idx;
-			out->expansions = expansions;
+			out->expansions = derech_sat_u32(expansions);
 			return;
 		}
 		if (expansions >= max_expansions) {
 			out->status = DERECH_PATH_BUDGET_EXCEEDED;
 			out->end_idx = best_idx;
-			out->expansions = expansions;
+			out->expansions = derech_sat_u32(expansions);
 			return;
 		}
 		expansions++;
@@ -278,5 +278,5 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	out->status = cost_pruned ? DERECH_PATH_BUDGET_EXCEEDED :
 		DERECH_PATH_UNREACHABLE;
 	out->end_idx = best_idx;
-	out->expansions = expansions;
+	out->expansions = derech_sat_u32(expansions);
 }

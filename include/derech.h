@@ -10,8 +10,10 @@
  * Design contract for FFI users (Python cffi, Raku NativeCall, LuaJIT, ...):
  *   - Opaque handles + fixed-layout POD structs.  No callbacks, no varargs,
  *     no thread-local error state, no globals.
- *   - All input buffers are fully copied during the call; derech never
- *     retains a caller pointer.
+ *   - Input buffers must stay valid and unmodified until the call returns;
+ *     no caller pointer is retained after it returns.  Map setters copy the
+ *     data they accept into map storage during the call; batch requests are
+ *     read in place by the worker threads of that synchronous call.
  *   - All result data is owned by the library and lives until the
  *     corresponding derech_results_destroy() call.
  *   - Every fallible function returns a derech_status (negative = error).
@@ -181,7 +183,11 @@ DERECH_API uint32_t derech_abi_version(void);
 /* ------------------------------------------------------------------ */
 
 #define DERECH_MAX_DIM 2048u         /* max map width/height            */
-#define DERECH_MAX_TAG_COMBOS 65536u /* distinct tag words per map      */
+#define DERECH_MAX_TAG_COMBOS 65536u /* distinct tag words ever observed
+                                        by a map — combos are interned
+                                        permanently and never reclaimed,
+                                        so this counts lifetime-cumulative
+                                        words, not the live set          */
 #define DERECH_MAX_PROFILES 256u     /* registered profiles per map     */
 #define DERECH_MAX_THREADS 64u       /* max explicit n_threads          */
 #define DERECH_MAX_GOALSETS 64u      /* registered goal sets per map    */
@@ -206,7 +212,11 @@ enum {
 	DERECH_E_BUSY = -4,                /* concurrent call on this map      */
 	DERECH_E_BAD_PROFILE = -5,         /* unknown profile id in a request  */
 	DERECH_E_TAG_COMBOS_EXHAUSTED = -6,/* > DERECH_MAX_TAG_COMBOS distinct
-	                                      tag words on one map            */
+	                                      tag words interned over the
+	                                      map's lifetime (combos are never
+	                                      reclaimed, so overwriting or
+	                                      clearing tiles does not free the
+	                                      words they once used)           */
 	DERECH_E_TOO_MANY_PROFILES = -7,   /* > DERECH_MAX_PROFILES            */
 	DERECH_E_BAD_GOALSET = -8,         /* unknown goal-set id in a request */
 	DERECH_E_TOO_MANY_GOALSETS = -9,   /* > DERECH_MAX_GOALSETS            */
@@ -355,6 +365,10 @@ DERECH_API uint64_t derech_map_generation(const derech_map *map);
 /* Terrain setters are validate-then-commit: on error, tile state and the
  * generation counter are unchanged.  An allocation grown while validating a
  * tag update may be retained for reuse, but uncommitted tag words disappear.
+ * Each distinct tag word a setter commits is interned permanently and counts
+ * against DERECH_MAX_TAG_COMBOS for the map's lifetime; combos are never
+ * reclaimed, so repeatedly rewriting tiles with new words can exhaust the
+ * cap (DERECH_E_TAG_COMBOS_EXHAUSTED) even if no tile currently uses them.
  * Passability values must satisfy 0 <= p <= 1 (NaN/inf rejected).
  * Full-grid variants require count == width * height, row-major
  * (index = y * width + x).  Rect variants read a row-major w*h buffer. */
@@ -454,10 +468,16 @@ typedef struct derech_request {
 	uint32_t goal_x, goal_y;   /* ignored when goalset != DERECH_NO_GOALSET */
 	uint32_t profile_id;
 	uint32_t flags;            /* DERECH_REQ_*                             */
-	uint32_t max_expansions;   /* settled-node budget; 0 = whole map       */
+	uint32_t max_expansions;   /* expansion budget: valid heap pops,
+	                              including re-expansions under weighted
+	                              A*; 0 = unlimited                        */
 	float max_perceived_cost;  /* ticks, <= DERECH_MAX_PATH_TICKS;
-	                            0 = unlimited                              */
-	float epsilon;             /* in [1, 256], or 0 for DEFAULT_EPSILON    */
+	                              quantized DOWN to Q8 (1/256) resolution,
+	                              so the cap is never looser than asked;
+	                              0 = unlimited                            */
+	float epsilon;             /* in [1, 256], or 0 for DEFAULT_EPSILON;
+	                              quantized DOWN to Q8 resolution, so the
+	                              cost bound is never looser than asked    */
 	uint32_t goalset;          /* goal-set id, or DERECH_NO_GOALSET (0)
 	                              for an ordinary single-goal request.
 	                              ALLOW_PARTIAL is invalid with a set.    */

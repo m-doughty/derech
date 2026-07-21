@@ -4,6 +4,19 @@ project(derech_consumer LANGUAGES C CXX)
 
 option(DERECH_EXPECT_STATIC "Require the installed static target contract" OFF)
 
+# A sanitizer-instrumented static archive carries the sanitizer's module
+# constructors, so a consumer must link the matching runtime.  The exported
+# target intentionally does not force these flags (BUILD_INTERFACE-scoped);
+# the install test passes them here so it can consume a sanitized build.
+set(DERECH_CONSUMER_SANITIZE_FLAGS "" CACHE STRING
+	"Sanitizer flags to build the install-consumer with")
+if(DERECH_CONSUMER_SANITIZE_FLAGS)
+	separate_arguments(_derech_san_flags UNIX_COMMAND
+		"${DERECH_CONSUMER_SANITIZE_FLAGS}")
+	add_compile_options(${_derech_san_flags})
+	add_link_options(${_derech_san_flags})
+endif()
+
 find_package(derech 0.5 CONFIG REQUIRED)
 
 add_executable(consumer_c consumer.c)

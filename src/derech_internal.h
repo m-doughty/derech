@@ -184,6 +184,32 @@ static inline uint64_t derech_q_round_u64(double v, uint64_t cap)
 	return (uint64_t)(v + 0.5);
 }
 
+/* Floor a non-negative double to uint32 with saturation at `cap`.  Used
+ * for contractual ceilings (epsilon, max_perceived_cost) where rounding
+ * up would make the effective bound looser than the caller requested;
+ * truncating keeps the guarantee conservative. */
+static inline uint32_t derech_q_floor(double v, uint32_t cap)
+{
+	if (v >= (double)cap) {
+		return cap;
+	}
+	if (v <= 0.0) {
+		return 0;
+	}
+	return (uint32_t)v;
+}
+
+static inline uint64_t derech_q_floor_u64(double v, uint64_t cap)
+{
+	if (v >= (double)cap) {
+		return cap;
+	}
+	if (v <= 0.0) {
+		return 0;
+	}
+	return (uint64_t)v;
+}
+
 static inline uint32_t derech_sat_u32(uint64_t v)
 {
 	return v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
@@ -428,7 +454,7 @@ typedef struct derech_search_result {
 
 void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
-	uint32_t eps_q, uint32_t max_expansions, uint64_t max_cost_q,
+	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
 	derech_search_result *out);
 
 /* batch.c — solve one request into ctx + stage; thread-safe across

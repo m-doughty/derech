@@ -163,8 +163,8 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 {
 	const derech_profile *prof = &map->profiles[req->profile_id];
 	int allow_partial = (req->flags & DERECH_REQ_ALLOW_PARTIAL) != 0;
-	uint32_t start_idx, goal_idx, eps_q, max_exp;
-	uint64_t max_cost_q;
+	uint32_t start_idx, goal_idx, eps_q;
+	uint64_t max_exp, max_cost_q;
 	derech_search_result sr;
 
 	row->worker = worker;
@@ -188,10 +188,10 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 	}
 
 	eps_q = req->epsilon == 0.0f ? DERECH_Q_EPS_DEFAULT :
-		derech_q_round((double)req->epsilon * 256.0, 1u << 16);
-	max_exp = req->max_expansions == 0 ? map->n : req->max_expansions;
+		derech_q_floor((double)req->epsilon * 256.0, 1u << 16);
+	max_exp = req->max_expansions == 0 ? UINT64_MAX : req->max_expansions;
 	max_cost_q = req->max_perceived_cost == 0.0f ? UINT64_MAX :
-		derech_q_round_u64((double)req->max_perceived_cost * 256.0,
+		derech_q_floor_u64((double)req->max_perceived_cost * 256.0,
 			UINT64_MAX - 1);
 
 	derech_search(map, ctx, prof, start_idx, goal_idx, eps_q, max_exp,

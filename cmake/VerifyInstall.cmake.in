@@ -29,7 +29,8 @@ set(_configure_command "@CMAKE_COMMAND@"
 	-B "${_consumer_build}"
 	-G "@CMAKE_GENERATOR@"
 	-DCMAKE_PREFIX_PATH=${_relocated}
-	-DDERECH_EXPECT_STATIC=${_expect_static})
+	-DDERECH_EXPECT_STATIC=${_expect_static}
+	"-DDERECH_CONSUMER_SANITIZE_FLAGS=@DERECH_CONSUMER_SANITIZE_FLAGS@")
 if(NOT "@CMAKE_GENERATOR_PLATFORM@" STREQUAL "")
 	list(APPEND _configure_command -A "@CMAKE_GENERATOR_PLATFORM@")
 endif()

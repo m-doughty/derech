@@ -2,7 +2,26 @@
 
 ## Unreleased
 
-- No changes yet.
+- `max_expansions == 0` now means a truly unlimited expansion budget instead
+  of `map->n`. Under weighted A* an inconsistent heuristic can re-expand nodes
+  at a strictly lower cost, so the count of valid heap pops can exceed the tile
+  count; the old `0 -> map->n` cap wrongly reported `DERECH_PATH_BUDGET_EXCEEDED`
+  for reachable goals. The internal expansion counter and budget are widened to
+  64-bit; the reported `expansions` field saturates at `UINT32_MAX`.
+- Contractual ceilings quantize DOWNWARD. `epsilon` and `max_perceived_cost`
+  now truncate to Q8 resolution rather than rounding half-up, so the effective
+  bound is never looser than requested (e.g. `epsilon = 1.002` quantizes to an
+  exact search instead of ~1.0039x). Terrain-weight quantization is unchanged
+  (nearest is correct there).
+- Documentation: the tag-combo cap is clarified as lifetime-cumulative (combos
+  are interned permanently and never reclaimed), and the FFI buffer contract is
+  corrected — input buffers must stay valid until the call returns and no
+  pointer is retained afterward, but batch requests are read in place rather
+  than copied.
+- Build hygiene: the test suite defaults off for `add_subdirectory()` consumers
+  (on only for a top-level build), and sanitizer/fuzzer flags on the `derech`
+  target are scoped with `$<BUILD_INTERFACE:...>` so instrumentation reaches
+  same-build-tree consumers without leaking into the exported/installed target.
 
 ## 0.5.0 — 2026-07-09
 

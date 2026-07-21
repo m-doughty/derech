@@ -5,7 +5,16 @@ project(derech
 	DESCRIPTION "Batch pathfinding over weighted tile grids"
 	LANGUAGES C)
 
-option(DERECH_BUILD_TESTS "Build the derech test suite" ON)
+# Only build the test suite by default when derech is the top-level build;
+# add_subdirectory() consumers opt in explicitly.  (Equivalent to
+# PROJECT_IS_TOP_LEVEL, computed by hand so the CMake floor stays at 3.16.)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+	set(DERECH_DEFAULT_BUILD_TESTS ON)
+else()
+	set(DERECH_DEFAULT_BUILD_TESTS OFF)
+endif()
+option(DERECH_BUILD_TESTS "Build the derech test suite"
+	${DERECH_DEFAULT_BUILD_TESTS})
 option(DERECH_BUILD_BENCH "Build the benchmark / counter-gate binary" OFF)
 option(DERECH_FUZZ "Build the libFuzzer harness (requires Clang)" OFF)
 option(DERECH_WERROR "Treat warnings as errors" OFF)
@@ -84,17 +93,23 @@ if(DERECH_SANITIZE)
 	if(MSVC)
 		message(FATAL_ERROR "DERECH_SANITIZE is not supported with MSVC")
 	endif()
+	# BUILD_INTERFACE keeps same-build-tree consumers instrumented while
+	# preventing the flags from leaking into the exported/installed target.
 	target_compile_options(derech PUBLIC
-		-fsanitize=address,undefined -fno-sanitize-recover=all)
-	target_link_options(derech PUBLIC -fsanitize=address,undefined)
+		$<BUILD_INTERFACE:-fsanitize=address,undefined>
+		$<BUILD_INTERFACE:-fno-sanitize-recover=all>)
+	target_link_options(derech PUBLIC
+		$<BUILD_INTERFACE:-fsanitize=address,undefined>)
 endif()
 
 if(DERECH_TSAN)
 	if(MSVC)
 		message(FATAL_ERROR "DERECH_TSAN is not supported with MSVC")
 	endif()
-	target_compile_options(derech PUBLIC -fsanitize=thread)
-	target_link_options(derech PUBLIC -fsanitize=thread)
+	target_compile_options(derech PUBLIC
+		$<BUILD_INTERFACE:-fsanitize=thread>)
+	target_link_options(derech PUBLIC
+		$<BUILD_INTERFACE:-fsanitize=thread>)
 endif()
 
 install(TARGETS derech
@@ -214,6 +229,16 @@ if(DERECH_BUILD_TESTS)
 		set(DERECH_INSTALL_TEST_EXPECT_STATIC OFF)
 	else()
 		set(DERECH_INSTALL_TEST_EXPECT_STATIC ON)
+	endif()
+	# Sanitizer instrumentation no longer leaks through the exported target
+	# (BUILD_INTERFACE-scoped), so a consumer of a sanitized static archive
+	# must opt into matching instrumentation itself.  Hand the flags to the
+	# installed-consumer test so it models that correctly.
+	set(DERECH_CONSUMER_SANITIZE_FLAGS "")
+	if(DERECH_SANITIZE)
+		set(DERECH_CONSUMER_SANITIZE_FLAGS "-fsanitize=address,undefined")
+	elseif(DERECH_TSAN)
+		set(DERECH_CONSUMER_SANITIZE_FLAGS "-fsanitize=thread")
 	endif()
 	configure_file(cmake/VerifyInstall.cmake.in
 		"${CMAKE_CURRENT_BINARY_DIR}/VerifyInstall.cmake" @ONLY)
@@ -352,10 +377,11 @@ if(DERECH_FUZZ)
 		-fno-sanitize-recover=all)
 	target_link_options(fuzz_derech PRIVATE
 		-fsanitize=fuzzer,address,undefined)
-	# the library itself needs matching instrumentation
+	# the library itself needs matching instrumentation; BUILD_INTERFACE
+	# keeps it out of any exported/installed target.
 	target_compile_options(derech PUBLIC
-		-fsanitize=fuzzer-no-link,address,undefined
-		-fno-sanitize-recover=all)
+		$<BUILD_INTERFACE:-fsanitize=fuzzer-no-link,address,undefined>
+		$<BUILD_INTERFACE:-fno-sanitize-recover=all>)
 	target_link_options(derech PUBLIC
-		-fsanitize=address,undefined)
+		$<BUILD_INTERFACE:-fsanitize=address,undefined>)
 endif()

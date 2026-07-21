@@ -521,6 +521,107 @@ static void test_expansion_budget(void)
 	derech_map_destroy(m);
 }
 
+static void test_unlimited_expansions_allows_reexpansion(void)
+{
+	/* Weighted A* with an inconsistent heuristic can re-expand nodes at a
+	 * strictly lower g, so the count of valid heap pops can exceed the tile
+	 * count (map->n).  A budget of 0 must mean "unlimited", not "map->n":
+	 * this 4x4 reaches the goal only after 17 valid pops (> n = 16).  The
+	 * Q8 entry costs below roundtrip exactly through passability and the
+	 * pop count is invariant across neighbor orderings. */
+	static const uint32_t cost[16] = {
+		257, 257, 257, 256,
+		300, 300, 768, 65536,
+		256, 400, 300, 16384,
+		256, 512, 16384, 256
+	};
+	float pass[16];
+	ref_map rm = { 4, 4, pass, NULL };
+	derech_profile_desc d = t_neutral_desc();
+	derech_map *m;
+	derech_results *res;
+	derech_request q;
+
+	for (uint32_t i = 0; i < 16; i++) {
+		pass[i] = (float)(256.0 / (double)cost[i]);
+	}
+	m = t_build_map(&rm);
+	T_CHECK(m != NULL);
+	d.connectivity = DERECH_CONN_4;
+	T_CHECK(derech_profile_register(m, &d) == 0);
+
+	/* 0 = unlimited: the goal is reachable, so it must be FOUND even though
+	 * the search takes more valid pops than there are tiles */
+	q = t_req(0, 2, 3, 3);
+	q.epsilon = 2.0f;
+	q.max_expansions = 0;
+	res = solve1(m, q);
+	T_CHECK(derech_result_status(res, 0) == DERECH_PATH_FOUND);
+	T_CHECK(derech_result_expansions(res, 0) > 4 * 4);
+	T_CHECK(derech_result_expansions(res, 0) == 17);
+	t_validate_result(&rm, &d, 0, 2, 3, 3, res, 0);
+	derech_results_destroy(res);
+
+	/* an explicit budget below the required pops still trips */
+	q.max_expansions = 16;
+	res = solve1(m, q);
+	T_CHECK(derech_result_status(res, 0) ==
+		DERECH_PATH_BUDGET_EXCEEDED);
+	T_CHECK(derech_result_expansions(res, 0) == 16);
+	derech_results_destroy(res);
+	derech_map_destroy(m);
+}
+
+static void test_epsilon_quantizes_down(void)
+{
+	/* epsilon must quantize DOWN to Q8 resolution so the effective bound is
+	 * never looser than requested.  1.002 * 256 = 256.512; rounding up would
+	 * give eps_q 257 (~1.00391x), floor gives 256 (exact search).  A 2048x2
+	 * grid whose direct lower-row route costs 1.002924x the optimal
+	 * up-across-down route proves it: an exact search must return the
+	 * cheaper detour. */
+	enum { W = 2048 };
+	float *pass = malloc((size_t)W * 2 * sizeof(*pass));
+	ref_map rm = { W, 2, pass, NULL };
+	derech_profile_desc d = t_neutral_desc();
+	derech_map *m;
+	derech_results *res;
+	derech_request q;
+	uint64_t want, got;
+
+	T_CHECK(pass != NULL);
+	if (pass == NULL) {
+		return;
+	}
+	/* upper row (y=0) entry cost 256 (p=1), lower row (y=1) cost 257 */
+	for (uint32_t x = 0; x < W; x++) {
+		pass[x] = 1.0f;                       /* 256 Q8 */
+		pass[W + x] = (float)(256.0 / 257.0); /* 257 Q8 */
+	}
+	m = t_build_map(&rm);
+	T_CHECK(m != NULL);
+	d.connectivity = DERECH_CONN_4;
+	T_CHECK(derech_profile_register(m, &d) == 0);
+
+	want = ref_solve(&rm, &d, 0, 1, W - 1, 1);
+	T_CHECK(want != REF_INF);
+
+	q = t_req(0, 1, W - 1, 1);
+	q.epsilon = 1.002f;
+	res = solve1(m, q);
+	T_CHECK(derech_result_status(res, 0) == DERECH_PATH_FOUND);
+	got = (uint64_t)llround(
+		(double)derech_result_total_perceived(res, 0) * 256.0);
+	/* down-quantized eps (256) means an exact search: the optimal detour */
+	T_CHECK(got == want);
+	/* and, unconditionally, within the contracted 1.002x of optimal */
+	T_CHECK((double)got <= 1.002 * (double)want);
+	t_validate_result(&rm, &d, 0, 1, W - 1, 1, res, 0);
+	derech_results_destroy(res);
+	derech_map_destroy(m);
+	free(pass);
+}
+
 static void test_cost_budget(void)
 {
 	derech_map *m = open_map(9, 1);
@@ -692,6 +793,8 @@ int main(void)
 	test_blocked_goal_fast_path();
 	test_blocked_start_escapable();
 	test_expansion_budget();
+	test_unlimited_expansions_allows_reexpansion();
+	test_epsilon_quantizes_down();
 	test_cost_budget();
 	test_unreachable_vs_cost_budget();
 	test_epsilon_bound();

@@ -269,7 +269,7 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 	}
 
 	max_cost_q = req->max_perceived_cost == 0.0f ? UINT64_MAX :
-		derech_q_round_u64((double)req->max_perceived_cost * 256.0,
+		derech_q_floor_u64((double)req->max_perceived_cost * 256.0,
 			UINT64_MAX - 1);
 	if (dist > max_cost_q) {
 		if (allow_partial && req->goalset == DERECH_NO_GOALSET) {
