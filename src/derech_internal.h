@@ -338,9 +338,13 @@ typedef struct derech_dirty_rect {
 #define DERECH_MAX_DIRTY_RECTS 16u
 
 typedef struct derech_dirty {
+	/* Dependency summaries survive loss of spatial detail, including edits
+	 * arriving after overflow.  Clear only after successful reconciliation. */
+	uint64_t all_tag_bits;
+	int any_pass_changed;
 	derech_dirty_rect rects[DERECH_MAX_DIRTY_RECTS];
 	uint32_t count;
-	int full; /* overflow or full-grid write: everything is dirty */
+	int full; /* spatial extent unknown/full-grid; dependencies remain exact */
 } derech_dirty;
 
 /* Connected-component labels for one blocking class (block_mask,
@@ -374,6 +378,7 @@ typedef struct derech_task {
 struct derech_map {
 	uint32_t w, h;
 	uint32_t n; /* w * h */
+	derech_work_stats work_stats; /* busy-lock protected, coordinator writes */
 	derech_atomic_u64 generation;
 	derech_atomic_u32 published_profile_count;
 	derech_busy_flag busy;
@@ -401,6 +406,7 @@ struct derech_map {
 	derech_pool *pool;
 	uint64_t worker_budget_bytes;
 	uint64_t scratch_retention_bytes;
+	const derech_avoidance *active_avoid; /* immutable, busy-lock scoped */
 	const struct derech_cancel *active_cancel;
 
 	/* goal-field cache: hash by (goal-or-set, profile) + LRU by last
@@ -452,6 +458,10 @@ typedef struct derech_search_result {
 	derech_status error;
 } derech_search_result;
 
+void derech_search_avoiding(const derech_map *map, derech_search_ctx *ctx,
+	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
+	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
+	const derech_avoidance *avoid, uint32_t goalset, const derech_field *guide, derech_search_result *out);
 void derech_search(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
 	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
@@ -460,7 +470,8 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 /* batch.c — solve one request into ctx + stage; thread-safe across
  * distinct ctxs (reads only immutable map state). */
 void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
-	uint32_t worker, const derech_request *req, derech_stage_row *row);
+	uint32_t worker, const derech_request *req, derech_stage_row *row,
+	const derech_avoidance *avoid, const derech_field *guide);
 
 /* batch.c — execute one task; thread-safe across distinct ctxs. */
 void derech_run_task(const derech_map *map, derech_search_ctx *ctx,

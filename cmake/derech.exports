@@ -1,8 +1,10 @@
 derech_abi_version
+derech_avoidance_allows_step
 derech_cancel_create
 derech_cancel_destroy
 derech_cancel_request
 derech_find_paths
+derech_find_paths_avoiding
 derech_find_paths_ex
 derech_goalset_count
 derech_goalset_register

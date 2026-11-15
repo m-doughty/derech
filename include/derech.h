@@ -459,7 +459,12 @@ DERECH_API uint32_t derech_profile_count(const derech_map *map);
 /* ------------------------------------------------------------------ */
 
 enum {
-	DERECH_REQ_ALLOW_PARTIAL = 1u << 0
+	DERECH_REQ_ALLOW_PARTIAL = 1u << 0,
+	/* Single-goal requests only: solve directly with A*, bypassing field
+	 * grouping/cache extraction and connected-component preprocessing. This
+	 * keeps a bounded one-off search from triggering a whole-map field build.
+	 * Normal search budgets, cancellation, costs and avoidance still apply. */
+	DERECH_REQ_DIRECT_SEARCH = 1u << 1
 };
 
 typedef struct derech_request {
@@ -483,6 +488,28 @@ typedef struct derech_request {
 	                              ALLOW_PARTIAL is invalid with a set.    */
 	uint32_t reserved[5];      /* must be zero; reserved within ABI 1     */
 } derech_request;
+
+/* Per-request exclusion circles. Borrowed and immutable until the batch returns.
+ * No profile, map tag or cached field is changed. Zero count preserves normal
+ * routing. Radius is 1..65535; count is at most eight. Coordinates may lie
+ * outside the map. Interior starts may move only to lower summed penetration
+ * across overlapping circles, until clear. Goals must be outside every circle.
+ * Searches obey ordinary terrain/corner/cost rules and request budgets. */
+#define DERECH_AVOID_MAX 8u
+typedef struct derech_avoid_circle {
+	int32_t x, y;
+	uint32_t radius;
+} derech_avoid_circle;
+typedef struct derech_avoidance {
+	uint32_t struct_size; /* sizeof(derech_avoidance) */
+	uint32_t count;
+	derech_avoid_circle circles[DERECH_AVOID_MAX];
+} derech_avoidance;
+/* Geometry only; accepts adjacent tiles or an identical pair (goal test).
+ * NULL/empty is unconstrained; other invalid descriptors/steps return zero.
+ * Boundaries belong to the safe side. */
+DERECH_API int derech_avoidance_allows_step(const derech_avoidance *avoid,
+	uint32_t x, uint32_t y, uint32_t nx, uint32_t ny);
 
 typedef struct derech_results derech_results;
 typedef struct derech_cancel derech_cancel;
@@ -513,6 +540,27 @@ DERECH_API derech_status derech_find_paths(derech_map *map,
 DERECH_API derech_status derech_find_paths_ex(derech_map *map,
 	const derech_request *reqs, uint32_t n_reqs,
 	const derech_find_opts *opts, derech_results **out);
+
+/* avoid is NULL or an array of n_reqs descriptors. Constrained searches never
+ * extract unconstrained cached paths; empty descriptors use the usual cache.
+ * Set queries use the static distance field as an A* lower bound, respecting
+ * the same expansion/cost/cancellation budget.
+ * No partial route is returned for a goal set, including budget exhaustion. */
+DERECH_API derech_status derech_find_paths_avoiding(derech_map *map,
+	const derech_request *reqs, uint32_t n_reqs, const derech_find_opts *opts,
+	const derech_avoidance *avoid, derech_results **out);
+
+/* Cumulative coordinator diagnostics. Counts submitted task work, including
+ * work from failed/cancelled batches; no timings, no worker-side mutation.
+ * Cache hits count requests served by a field present at first planning lookup.
+ * Extracts exclude constrained searches that only use a field as a heuristic. */
+typedef struct derech_work_stats {
+	uint32_t struct_size;
+	uint32_t reserved0;
+	uint64_t field_builds, cache_hits, field_extracts, searches;
+} derech_work_stats;
+DERECH_API derech_status derech_map_get_work_stats(const derech_map *map,
+	derech_work_stats *out);
 
 DERECH_API void derech_results_destroy(derech_results *results);
 

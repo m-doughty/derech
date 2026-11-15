@@ -175,8 +175,8 @@ if(DERECH_BUILD_TESTS)
 		C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 	target_compile_options(derech_test_support PRIVATE ${DERECH_C_WARNINGS})
 
-	set(DERECH_TEST_NAMES map profile search batch field goalset property abi
-		concurrency extreme resource)
+	set(DERECH_TEST_NAMES map profile search batch field goalset dirty property abi
+		concurrency extreme resource avoidance)
 	foreach(t IN LISTS DERECH_TEST_NAMES)
 		add_executable(test_${t} tests/test_${t}.c)
 		target_link_libraries(test_${t} PRIVATE derech_test_support)

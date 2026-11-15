@@ -440,8 +440,8 @@ static void test_dirty_adjacent_unblock(void)
 
 static void test_dirty_overflow_fallback(void)
 {
-	/* more distinct edits than the rect log holds: everything flushes,
-	 * correctness intact */
+	/* More passability edits than the rect log holds: all fields flush,
+	 * while exact pathfinding remains correct. */
 	enum { W = 20, H = 20 };
 	derech_map *m = derech_map_create(W, H, NULL);
 	derech_profile_desc d = t_neutral_desc();

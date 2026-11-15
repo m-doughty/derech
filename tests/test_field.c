@@ -56,7 +56,14 @@ static void test_group_uses_field(void)
 		q[i] = t_req(i, 2 * i + 1, 20, 20); /* distinct starts */
 		q[i].epsilon = 1.25f;
 	}
+	derech_work_stats work = {.struct_size = sizeof(work)};
+	T_CHECK(sizeof(work) == 40);
+	T_CHECK(derech_map_get_work_stats(NULL, &work) == DERECH_E_INVALID_ARG);
+	T_CHECK(derech_map_get_work_stats(m, &work) == DERECH_OK);
+	T_CHECK(work.field_builds == 0 && work.cache_hits == 0);
 	res = run_batch(m, q, NREQ);
+	T_CHECK(derech_map_get_work_stats(m, &work) == DERECH_OK);
+	T_CHECK(work.field_builds == 1 && work.field_extracts == NREQ && work.cache_hits == 0 && work.searches == 0);
 	for (uint32_t i = 0; i < NREQ; i++) {
 		T_CHECK(derech_result_status(res, i) == DERECH_PATH_FOUND);
 		T_CHECK(derech_result_expansions(res, i) == 0);
@@ -67,6 +74,15 @@ static void test_group_uses_field(void)
 		t_validate_result(&rm, &d, q[i].start_x, q[i].start_y, 20, 20,
 			res, i);
 	}
+	derech_results_destroy(res);
+	res = run_batch(m, q, NREQ);
+	T_CHECK(derech_map_get_work_stats(m, &work) == DERECH_OK);
+	T_CHECK(work.field_builds == 1 && work.field_extracts == 2 * NREQ && work.cache_hits == NREQ && work.searches == 0);
+	T_CHECK(derech_busy_acquire(&m->busy));
+	T_CHECK(derech_map_get_work_stats(m, &work) == DERECH_E_BUSY);
+	derech_busy_release(&m->busy);
+	work.struct_size = 0;
+	T_CHECK(derech_map_get_work_stats(m, &work) == DERECH_E_INVALID_ARG);
 	derech_results_destroy(res);
 	derech_map_destroy(m);
 }

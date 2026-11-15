@@ -261,7 +261,7 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 		 * goal.  Only a closest-approach partial needs a search (and
 		 * planning rejects the partial flag for set queries). */
 		if (allow_partial && req->goalset == DERECH_NO_GOALSET) {
-			derech_solve_request(map, ctx, worker, req, row);
+			derech_solve_request(map, ctx, worker, req, row, NULL, NULL);
 			return;
 		}
 		row->status = DERECH_PATH_UNREACHABLE;
@@ -273,7 +273,7 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 			UINT64_MAX - 1);
 	if (dist > max_cost_q) {
 		if (allow_partial && req->goalset == DERECH_NO_GOALSET) {
-			derech_solve_request(map, ctx, worker, req, row);
+			derech_solve_request(map, ctx, worker, req, row, NULL, NULL);
 			return;
 		}
 		row->status = DERECH_PATH_BUDGET_EXCEEDED;
@@ -328,7 +328,7 @@ void derech_field_extract(const derech_map *map, derech_search_ctx *ctx,
 				row->error = DERECH_E_NOMEM;
 				return;
 			}
-			derech_solve_request(map, ctx, worker, req, row);
+			derech_solve_request(map, ctx, worker, req, row, NULL, NULL);
 			return;
 		}
 		row->status = DERECH_PATH_FOUND;
@@ -1092,19 +1092,11 @@ static int field_affected_by(const derech_map *map, const derech_field *f,
 derech_status derech_reconcile(derech_map *map)
 {
 	derech_dirty *d = &map->dirty;
-	uint64_t all_bits = 0;
-	int any_pass = 0;
+	uint64_t all_bits = d->all_tag_bits;
+	int any_pass = d->any_pass_changed;
 
 	if (d->count == 0 && !d->full) {
 		return DERECH_OK;
-	}
-	for (uint32_t r = 0; r < d->count; r++) {
-		all_bits |= d->rects[r].tag_bits;
-		any_pass |= d->rects[r].pass_changed;
-	}
-	if (d->full) {
-		all_bits = ~0ULL;
-		any_pass = 1;
 	}
 
 	/* predicate memberships (bumps epoch when membership changed) */
@@ -1135,7 +1127,8 @@ derech_status derech_reconcile(derech_map *map)
 					f->set_epoch) {
 				kill = 1;
 			} else if (d->full) {
-				kill = 1;
+				kill = any_pass || (all_bits &
+					map->profiles[f->profile_id].relevant_mask) != 0;
 			} else {
 				for (uint32_t r = 0; r < d->count; r++) {
 					int affected = field_affected_by(map, f,
@@ -1176,5 +1169,7 @@ derech_status derech_reconcile(derech_map *map)
 
 	d->count = 0;
 	d->full = 0;
+	d->all_tag_bits = 0;
+	d->any_pass_changed = 0;
 	return DERECH_OK;
 }

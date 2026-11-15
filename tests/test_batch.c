@@ -288,6 +288,7 @@ static void make_requests(t_rng *rng, uint32_t w, uint32_t h, uint32_t n,
 		out[i].profile_id = t_rng_below(rng, 3);
 		out[i].flags = (t_rng_next(rng) & 1) ?
 			DERECH_REQ_ALLOW_PARTIAL : 0;
+		if (i % 3 == 0) out[i].flags |= DERECH_REQ_DIRECT_SEARCH;
 		out[i].epsilon = epsilons[t_rng_below(rng, 4)];
 	}
 }
@@ -366,6 +367,59 @@ static void test_pool_reuse_stress(void)
 	derech_map_destroy(threaded);
 }
 
+static void test_direct_search(void)
+{
+	float pass[32 * 24];
+	for (uint32_t i = 0; i < 32 * 24; i++) pass[i] = 1;
+	ref_map rm = {32, 24, pass, NULL};
+	derech_map *m = t_build_map(&rm);
+	derech_profile_desc d = t_neutral_desc(); d.connectivity = DERECH_CONN_4;
+	T_CHECK(m != NULL); if (!m) return;
+	T_CHECK(derech_profile_register(m, &d) == 0);
+	derech_request q[4]; derech_results *res = NULL;
+	for (uint32_t i = 0; i < 4; i++) {
+		q[i] = t_req(i, 0, 31, 20); q[i].flags = DERECH_REQ_DIRECT_SEARCH; q[i].max_expansions = 1;
+	}
+	derech_work_stats before = {.struct_size=sizeof(before)}, after = {.struct_size=sizeof(after)};
+	T_CHECK(derech_map_get_work_stats(m, &before) == DERECH_OK);
+	T_CHECK(derech_find_paths(m, q, 4, &res) == DERECH_OK);
+	for (uint32_t i = 0; i < 4; i++) {
+		T_CHECK(derech_result_status(res, i) == DERECH_PATH_BUDGET_EXCEEDED);
+		T_CHECK(derech_result_expansions(res, i) == 1 && derech_result_length(res, i) == 0);
+	}
+	derech_results_destroy(res); res = NULL;
+	T_CHECK(derech_map_get_work_stats(m, &after) == DERECH_OK);
+	T_CHECK(after.field_builds == before.field_builds && after.field_extracts == before.field_extracts);
+	T_CHECK(after.searches == before.searches + 4 && after.cache_hits == before.cache_hits);
+	/* Ordinary same-point batches still populate and reuse their shared field. */
+	for (uint32_t i = 0; i < 4; i++) { q[i].flags = 0; q[i].max_expansions = 0; }
+	T_CHECK(derech_find_paths(m, q, 4, &res) == DERECH_OK);
+	for (uint32_t i = 0; i < 4; i++) T_CHECK(derech_result_total_perceived_q8(res, i) == ref_solve(&rm, &d, i, 0, 31, 20));
+	derech_results_destroy(res); res = NULL;
+	T_CHECK(derech_map_get_work_stats(m, &before) == DERECH_OK);
+	T_CHECK(before.field_builds == after.field_builds + 1);
+	for (uint32_t i = 0; i < 4; i++) { q[i].flags = DERECH_REQ_DIRECT_SEARCH; q[i].max_expansions = 1; }
+	T_CHECK(derech_find_paths(m, q, 4, &res) == DERECH_OK);
+	for (uint32_t i = 0; i < 4; i++) T_CHECK(derech_result_status(res, i) == DERECH_PATH_BUDGET_EXCEEDED);
+	derech_results_destroy(res); res = NULL;
+	T_CHECK(derech_map_get_work_stats(m, &after) == DERECH_OK);
+	T_CHECK(after.field_builds == before.field_builds && after.field_extracts == before.field_extracts && after.cache_hits == before.cache_hits);
+	q[0].max_expansions = 0;
+	T_CHECK(derech_find_paths(m, q, 1, &res) == DERECH_OK);
+	T_CHECK(derech_result_total_perceived_q8(res, 0) == ref_solve(&rm, &d, 0, 0, 31, 20));
+	t_validate_result(&rm, &d, 0, 0, 31, 20, res, 0);
+	derech_results_destroy(res); res = NULL;
+	q[0].flags |= DERECH_REQ_ALLOW_PARTIAL; q[0].max_expansions = 8;
+	T_CHECK(derech_find_paths(m, q, 1, &res) == DERECH_OK);
+	T_CHECK(derech_result_status(res, 0) == DERECH_PATH_BUDGET_EXCEEDED && derech_result_expansions(res, 0) == 8);
+	T_CHECK(derech_result_length(res, 0) > 0);
+	derech_results_destroy(res); res = NULL;
+	uint32_t xy[] = {31,20}; int32_t gs = derech_goalset_register(m, xy, 1, 0);
+	T_CHECK(gs > 0); q[0].goalset = (uint32_t)gs; q[0].flags = DERECH_REQ_DIRECT_SEARCH;
+	T_CHECK(derech_find_paths(m, q, 1, &res) == DERECH_E_INVALID_ARG && res == NULL);
+	derech_map_destroy(m);
+}
+
 int main(void)
 {
 	test_empty_and_null();
@@ -375,5 +429,6 @@ int main(void)
 	test_results_outlive_edits();
 	test_thread_count_invariance();
 	test_pool_reuse_stress();
+	test_direct_search();
 	return t_done("test_batch");
 }

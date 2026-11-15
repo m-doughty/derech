@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add `derech_find_paths_avoiding` with immutable per-request exclusion circles.
+  Constrained searches use shared static distances as lower bounds and check
+  every traversed edge and destination. Interior starts can escape overlapping
+  circles. Request layout, terrain costs and ordinary cached routing are unchanged.
+- Dirty-log overflow now preserves changed-tag and passability dependencies.
+  Unaffected goal fields and component labels survive overflow and full-grid
+  tag writes. Pending dependencies remain available after cancellation or
+  allocation failure so reconciliation can retry safely.
 - `max_expansions == 0` now means a truly unlimited expansion budget instead
   of `map->n`. Under weighted A* an inconsistent heuristic can re-expand nodes
   at a strictly lower cost, so the count of valid heap pops can exceed the tile

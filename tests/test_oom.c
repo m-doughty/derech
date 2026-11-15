@@ -570,9 +570,10 @@ static void test_failed_batch_preserves_old_field(void)
 	derech_map_destroy(map);
 }
 
-static void test_predicate_refresh_rollback(void)
+static void test_predicate_refresh_rollback(int overflow, uint64_t failure)
 {
-	derech_map *map = open_map(16, 1);
+	uint32_t width = overflow ? 32u : 16u;
+	derech_map *map = open_map(width, 1);
 	derech_request req = t_req(0, 0, 0, 0);
 	derech_results *res = NULL;
 	int32_t set_id;
@@ -584,7 +585,7 @@ static void test_predicate_refresh_rollback(void)
 	if (map == NULL) {
 		return;
 	}
-	T_CHECK(derech_map_set_tags_at(map, 15, 0, 1) == DERECH_OK);
+	T_CHECK(derech_map_set_tags_at(map, width - 1, 0, 1) == DERECH_OK);
 	set_id = derech_goalset_register_tags(map, 1, 0, 0);
 	T_CHECK(set_id == 1);
 	if (set_id != 1) {
@@ -599,9 +600,15 @@ static void test_predicate_refresh_rollback(void)
 	old_epoch = map->goalsets[0].epoch;
 	T_CHECK(map->goalsets[0].member_count == 1);
 
-	T_CHECK(derech_map_set_tags_at(map, 14, 0, 1) == DERECH_OK);
+	if (overflow) {
+		for (uint32_t x = 0; x < 17; x++) {
+			T_CHECK(derech_map_set_tags_at(map, x, 0, 32) == DERECH_OK);
+		}
+		T_CHECK(map->dirty.full);
+	}
+	T_CHECK(derech_map_set_tags_at(map, width - 2, 0, 1) == DERECH_OK);
 	/* result, rows, and stage allocate before transactional rematerialization */
-	derech_test_alloc_fail_after(3);
+	derech_test_alloc_fail_after(failure);
 	T_CHECK(derech_find_paths(map, &req, 1, &res) == DERECH_E_NOMEM);
 	T_CHECK(res == NULL);
 	T_CHECK(map->goalsets[0].members == old_members);
@@ -609,15 +616,51 @@ static void test_predicate_refresh_rollback(void)
 	T_CHECK(map->goalsets[0].member_count == 1);
 	T_CHECK(map->field_lru_head == old_field);
 	T_CHECK(map->field_bytes == old_field_bytes);
+	if (overflow) T_CHECK(map->dirty.full);
 
 	derech_test_alloc_disable();
+	/* A later edit while still full must also survive until successful retry. */
+	if (overflow) {
+		T_CHECK(derech_map_set_passability_at(map, 20, 0, 0.5f) == DERECH_OK);
+	}
 	T_CHECK(derech_find_paths(map, &req, 1, &res) == DERECH_OK);
 	check_found(res);
-	T_CHECK(derech_result_length(res, 0) == 14);
+	T_CHECK(derech_result_length(res, 0) == width - 2);
+	T_CHECK(derech_result_total_perceived(res, 0) ==
+		(float)(width - 2 + (overflow ? 1 : 0)));
 	T_CHECK(map->goalsets[0].member_count == 2);
 	T_CHECK(map->goalsets[0].epoch == old_epoch + 1);
+	T_CHECK(!map->dirty.full && map->dirty.count == 0);
 	derech_results_destroy(res);
 	derech_map_destroy(map);
+}
+
+static void test_avoidance_rollback(void)
+{
+	uint64_t allocations = 0;
+	for (uint64_t failure = 0; failure <= allocations + 1; failure++) {
+		derech_map *map = open_map(16, 16);
+		derech_request req = t_req(0, 8, 15, 8);
+		uint32_t goal[] = {15, 8};
+		req.goalset = (uint32_t)derech_goalset_register(map, goal, 1, 0);
+		derech_avoidance avoid = {.struct_size = sizeof(avoid), .count = 1, .circles = {{8, 8, 3}}};
+		derech_results *res = NULL;
+		if (failure == 0) derech_test_alloc_disable();
+		else derech_test_alloc_fail_after(failure - 1);
+		derech_status st = derech_find_paths_avoiding(map, &req, 1, NULL, &avoid, &res);
+		if (failure == 0) allocations = derech_test_alloc_attempts();
+		T_CHECK(st == DERECH_OK || st == DERECH_E_NOMEM);
+		if (st == DERECH_OK) check_found(res);
+		else T_CHECK(res == NULL);
+		derech_results_destroy(res); res = NULL;
+		T_CHECK(map->active_avoid == NULL && map->active_cancel == NULL);
+		derech_test_alloc_disable();
+		T_CHECK(derech_find_paths_avoiding(map, &req, 1, NULL, &avoid, &res) == DERECH_OK);
+		check_found(res);
+		derech_results_destroy(res);
+		derech_map_destroy(map);
+	}
+	T_CHECK(allocations > 0);
 }
 
 int main(void)
@@ -635,7 +678,10 @@ int main(void)
 	test_tag_interner_rollback();
 	test_required_field_rollback_sweep();
 	test_failed_batch_preserves_old_field();
-	test_predicate_refresh_rollback();
+	test_predicate_refresh_rollback(0, 3);
+	test_predicate_refresh_rollback(1, 3);
+	test_predicate_refresh_rollback(1, 4);
+	test_avoidance_rollback();
 	derech_test_alloc_disable();
 	return t_done("oom");
 }

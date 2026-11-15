@@ -31,12 +31,33 @@ if (derech_abi_version() != DERECH_ABI_VERSION) {
   the library functions declared in `derech.h`.
 - Result buffers belong to their `derech_results` object and remain valid
   until `derech_results_destroy`.
+- `derech_avoidance` is 104 bytes: `struct_size`, `count`, then eight
+  12-byte circles. A circle contains signed 32-bit x/y and an unsigned radius.
+  `derech_find_paths_avoiding` adds an optional parallel descriptor array without
+  changing `derech_request` or using its reserved words. The array stays
+  immutable and alive until the call returns. Existing callers are unaffected.
 
 Exact size and offset assertions live in `tests/test_abi.c`. The public shared
 library export set is frozen in `cmake/derech.exports`; shared CI rejects
 missing or additional exports.
 
+## Work Diagnostics
+
+`derech_work_stats` is 40 bytes: 32-bit `struct_size` and reserved storage,
+then four 64-bit cumulative counters starting at offset 8. Zero-initialize it
+and set `struct_size` before calling `derech_map_get_work_stats`. The getter
+uses the map busy guard and returns `DERECH_E_BUSY` during another map call.
+Counters describe coordinator-submitted work; workers never mutate them.
+This additive API does not change existing public layouts or ABI epoch 1.
+Consumers using it must install matching headers and a rebuilt library.
+
 ## Library Identity
+
+`DERECH_REQ_DIRECT_SEARCH` is an additive request flag within the existing
+64-byte layout. It is valid only for single-goal requests and skips field/cache
+and component-label planning. It can be combined with `ALLOW_PARTIAL`.
+Older libraries reject this unknown flag; consumers must rebuild and install
+matching headers and libraries before using it. ABI epoch 1 is unchanged.
 
 The installed shared library has ABI soname/install-name epoch `1` and file
 version `0.5.0`. CMake consumers should link `derech::derech`. Static C and

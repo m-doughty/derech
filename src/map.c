@@ -661,6 +661,20 @@ derech_status derech_map_get_memory_stats(const derech_map *const_map,
 	return DERECH_OK;
 }
 
+derech_status derech_map_get_work_stats(const derech_map *const_map,
+	derech_work_stats *out)
+{
+	derech_map *map = (derech_map *)const_map;
+	if (map == NULL || out == NULL || out->struct_size != sizeof(*out))
+		return DERECH_E_INVALID_ARG;
+	if (!derech_busy_acquire(&map->busy)) return DERECH_E_BUSY;
+	derech_work_stats result = map->work_stats;
+	derech_busy_release(&map->busy);
+	result.struct_size = sizeof(result);
+	*out = result;
+	return DERECH_OK;
+}
+
 derech_status derech_cancel_create(derech_cancel **out)
 {
 	derech_cancel *cancel;
@@ -704,6 +718,8 @@ void derech_dirty_add(derech_map *map, uint32_t x, uint32_t y, uint32_t w,
 	if (!pass_changed && tag_bits == 0) {
 		return;
 	}
+	d->all_tag_bits |= tag_bits;
+	d->any_pass_changed |= pass_changed != 0;
 	if (d->full) {
 		return;
 	}

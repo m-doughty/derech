@@ -159,7 +159,8 @@ static derech_status emit_path(const derech_map *map,
 /* ------------------------------------------------------------------ */
 
 void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
-	uint32_t worker, const derech_request *req, derech_stage_row *row)
+	uint32_t worker, const derech_request *req, derech_stage_row *row,
+	const derech_avoidance *avoid, const derech_field *guide)
 {
 	const derech_profile *prof = &map->profiles[req->profile_id];
 	int allow_partial = (req->flags & DERECH_REQ_ALLOW_PARTIAL) != 0;
@@ -170,19 +171,20 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 	row->worker = worker;
 	row->status = DERECH_PATH_INVALID_ENDPOINT;
 	if (req->start_x >= map->w || req->start_y >= map->h ||
-		req->goal_x >= map->w || req->goal_y >= map->h) {
+		(req->goalset == 0 && (req->goal_x >= map->w || req->goal_y >= map->h))) {
 		return;
 	}
 	start_idx = req->start_y * map->w + req->start_x;
 	goal_idx = req->goal_y * map->w + req->goal_x;
 
-	if (start_idx == goal_idx) {
+	if (!req->goalset && start_idx == goal_idx &&
+		derech_avoidance_allows_step(avoid, req->start_x, req->start_y, req->start_x, req->start_y)) {
 		row->status = DERECH_PATH_FOUND;
 		return;
 	}
 	/* an unenterable goal can never be reached; skip the search unless
 	 * the caller wants the closest approach */
-	if (derech_tile_blocked(map, prof, goal_idx) && !allow_partial) {
+	if (!req->goalset && derech_tile_blocked(map, prof, goal_idx) && !allow_partial) {
 		row->status = DERECH_PATH_UNREACHABLE;
 		return;
 	}
@@ -194,8 +196,8 @@ void derech_solve_request(const derech_map *map, derech_search_ctx *ctx,
 		derech_q_floor_u64((double)req->max_perceived_cost * 256.0,
 			UINT64_MAX - 1);
 
-	derech_search(map, ctx, prof, start_idx, goal_idx, eps_q, max_exp,
-		max_cost_q, &sr);
+	derech_search_avoiding(map, ctx, prof, start_idx, goal_idx, eps_q, max_exp,
+		max_cost_q, avoid, req->goalset, guide, &sr);
 	if (sr.error != DERECH_OK) {
 		row->error = sr.error;
 		return;
@@ -220,12 +222,24 @@ void derech_run_task(const derech_map *map, derech_search_ctx *ctx,
 	switch (task->kind) {
 	case DERECH_TASK_SOLVE:
 		derech_solve_request(map, ctx, worker, &reqs[task->req_idx],
-			&stage[task->req_idx]);
+			&stage[task->req_idx], map->active_avoid == NULL ? NULL :
+			&map->active_avoid[task->req_idx], NULL);
 		break;
 	case DERECH_TASK_FIELD_BUILD:
 		derech_field_build(map, ctx, task->field);
 		break;
 	default: /* DERECH_TASK_EXTRACT */
+		if (map->active_avoid != NULL && map->active_avoid[task->req_idx].count) {
+			if (!task->field->ok) {
+				stage[task->req_idx].error = task->field->error;
+				break;
+			}
+			/* The base distances are admissible lower bounds. They guide the
+			 * constrained search; their unvalidated paths are never adopted. */
+			derech_solve_request(map, ctx, worker, &reqs[task->req_idx],
+				&stage[task->req_idx], &map->active_avoid[task->req_idx], task->field);
+			break;
+		}
 		derech_field_extract(map, ctx, worker, task->field,
 			&reqs[task->req_idx], &stage[task->req_idx]);
 		break;
@@ -245,6 +259,13 @@ static derech_status validate_requests(const derech_map *map,
 		if ((i & 1023u) == 0 && derech_cancelled(map)) {
 			return DERECH_E_CANCELLED;
 		}
+		if (map->active_avoid != NULL) {
+			const derech_avoidance *a = &map->active_avoid[i];
+			if (a->struct_size != sizeof(*a) || a->count > DERECH_AVOID_MAX) return DERECH_E_INVALID_ARG;
+			for (uint32_t j = 0; j < a->count; j++) {
+				if (!a->circles[j].radius || a->circles[j].radius > 65535) return DERECH_E_INVALID_ARG;
+			}
+		}
 		if (q->struct_size != sizeof(*q)) {
 			return DERECH_E_INVALID_ARG;
 		}
@@ -256,7 +277,7 @@ static derech_status validate_requests(const derech_map *map,
 		if (q->profile_id >= map->profile_count) {
 			return DERECH_E_BAD_PROFILE;
 		}
-		if ((q->flags & ~(uint32_t)DERECH_REQ_ALLOW_PARTIAL) != 0) {
+		if ((q->flags & ~(uint32_t)(DERECH_REQ_ALLOW_PARTIAL | DERECH_REQ_DIRECT_SEARCH)) != 0) {
 			return DERECH_E_INVALID_ARG;
 		}
 		if (q->goalset != DERECH_NO_GOALSET) {
@@ -266,7 +287,7 @@ static derech_status validate_requests(const derech_map *map,
 			}
 			/* no gradient exists toward an unreachable SET, so
 			 * closest-approach partials are undefined */
-			if ((q->flags & DERECH_REQ_ALLOW_PARTIAL) != 0) {
+			if ((q->flags & (DERECH_REQ_ALLOW_PARTIAL | DERECH_REQ_DIRECT_SEARCH)) != 0) {
 				return DERECH_E_INVALID_ARG;
 			}
 		}
@@ -406,6 +427,14 @@ static derech_status run_tasks(derech_map *map, const derech_task *tasks,
 	if (rc != DERECH_OK) {
 		return rc;
 	}
+	for (uint32_t k = 0; k < n; k++) {
+		const derech_task *t = &tasks[k];
+		if (t->kind == DERECH_TASK_FIELD_BUILD) map->work_stats.field_builds++;
+		else if (t->kind == DERECH_TASK_SOLVE ||
+			(map->active_avoid != NULL && map->active_avoid[t->req_idx].count))
+			map->work_stats.searches++;
+		else map->work_stats.field_extracts++;
+	}
 	if (map->pool != NULL && participants > 1) {
 		derech_pool_run(map->pool, map, tasks, n, reqs, stage,
 			participants);
@@ -532,6 +561,13 @@ static derech_status plan_and_execute(derech_map *map,
 		}
 		start_idx = q->start_y * map->w + q->start_x;
 		prof = &map->profiles[q->profile_id];
+		if (!q->goalset && ((q->flags & DERECH_REQ_DIRECT_SEARCH) ||
+			(map->active_avoid != NULL && map->active_avoid[i].count))) {
+			t1[n1].kind = DERECH_TASK_SOLVE;
+			t1[n1].req_idx = i;
+			t1[n1++].field = NULL;
+			continue;
+		}
 
 		if (q->goalset != DERECH_NO_GOALSET) {
 			/* set queries are always field-backed: look up the
@@ -539,6 +575,7 @@ static derech_status plan_and_execute(derech_map *map,
 			cached = derech_field_cache_lookup(map, 0, q->goalset,
 				q->profile_id);
 			if (cached != NULL) {
+				map->work_stats.cache_hits++;
 				t1[n1].kind = DERECH_TASK_EXTRACT;
 				t1[n1].req_idx = i;
 				t1[n1].field = cached;
@@ -601,6 +638,7 @@ static derech_status plan_and_execute(derech_map *map,
 		cached = derech_field_cache_lookup(map, goal_idx,
 			DERECH_NO_GOALSET, q->profile_id);
 		if (cached != NULL) {
+			map->work_stats.cache_hits++;
 			t1[n1].kind = DERECH_TASK_EXTRACT;
 			t1[n1].req_idx = i;
 			t1[n1].field = cached;
@@ -727,9 +765,9 @@ done:
 	return rc;
 }
 
-derech_status derech_find_paths_ex(derech_map *map,
+derech_status derech_find_paths_avoiding(derech_map *map,
 	const derech_request *reqs, uint32_t n_reqs,
-	const derech_find_opts *opts, derech_results **out)
+	const derech_find_opts *opts, const derech_avoidance *avoid, derech_results **out)
 {
 	derech_results *r;
 	derech_stage_row *stage = NULL;
@@ -745,14 +783,17 @@ derech_status derech_find_paths_ex(derech_map *map,
 	if (!derech_busy_acquire(&map->busy)) {
 		return DERECH_E_BUSY;
 	}
+	map->active_avoid = avoid;
 	map->active_cancel = opts == NULL ? NULL : opts->cancel;
 	if (derech_cancelled(map)) {
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		return DERECH_E_CANCELLED;
 	}
 	rc = validate_requests(map, reqs, n_reqs);
 	if (rc != DERECH_OK) {
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		return rc;
@@ -760,12 +801,14 @@ derech_status derech_find_paths_ex(derech_map *map,
 
 	r = calloc(1, sizeof(*r));
 	if (r == NULL) {
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		return DERECH_E_NOMEM;
 	}
 	r->count = n_reqs;
 	if (n_reqs == 0) {
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		*out = r;
@@ -773,6 +816,7 @@ derech_status derech_find_paths_ex(derech_map *map,
 	}
 	if (!checked_array_bytes(n_reqs, sizeof(*r->rows), &rows_bytes) ||
 		!checked_array_bytes(n_reqs, sizeof(*stage), &stage_bytes)) {
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
@@ -783,6 +827,7 @@ derech_status derech_find_paths_ex(derech_map *map,
 	stage = calloc(1, stage_bytes);
 	if (r->rows == NULL || stage == NULL) {
 		free(stage);
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
@@ -799,6 +844,7 @@ derech_status derech_find_paths_ex(derech_map *map,
 		derech_field_cache_finish_batch(map, 0);
 		derech_labels_finish_call(map, 0);
 		derech_contexts_trim(map);
+		map->active_avoid = NULL;
 		map->active_cancel = NULL;
 		derech_busy_release(&map->busy);
 		derech_results_destroy(r);
@@ -814,6 +860,7 @@ derech_status derech_find_paths_ex(derech_map *map,
 	derech_field_cache_finish_batch(map, rc == DERECH_OK);
 	derech_labels_finish_call(map, rc == DERECH_OK);
 	derech_contexts_trim(map);
+	map->active_avoid = NULL;
 	map->active_cancel = NULL;
 	derech_busy_release(&map->busy);
 	if (rc != DERECH_OK) {
@@ -822,6 +869,12 @@ derech_status derech_find_paths_ex(derech_map *map,
 	}
 	*out = r;
 	return DERECH_OK;
+}
+
+derech_status derech_find_paths_ex(derech_map *map, const derech_request *reqs,
+	uint32_t n_reqs, const derech_find_opts *opts, derech_results **out)
+{
+	return derech_find_paths_avoiding(map, reqs, n_reqs, opts, NULL, out);
 }
 
 derech_status derech_find_paths(derech_map *map, const derech_request *reqs,

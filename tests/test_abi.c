@@ -7,6 +7,9 @@
 #include "support.h"
 
 _Static_assert(DERECH_ABI_VERSION == 1u, "unexpected ABI epoch");
+_Static_assert(sizeof(derech_avoidance) == 104, "avoidance descriptor ABI");
+_Static_assert(offsetof(derech_avoidance, circles) == 8, "avoidance circles ABI offset");
+_Static_assert(sizeof(derech_avoid_circle) == 12, "avoidance circle ABI");
 _Static_assert(sizeof(derech_request) == 64, "request ABI must stay 64 bytes");
 _Static_assert(offsetof(derech_request, struct_size) == 0,
 	"request.struct_size ABI offset");

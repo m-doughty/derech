@@ -152,10 +152,21 @@ static int corner_forbidden(const derech_map *map,
 /* Search                                                              */
 /* ------------------------------------------------------------------ */
 
-void derech_search(const derech_map *map, derech_search_ctx *ctx,
+/* A field can describe a long maze, unlike a geometric lower bound. Avoid
+ * overflow when weighting that distance at the public maximum epsilon. */
+static uint64_t priority(uint64_t g, uint64_t h, uint32_t eps_q)
+{
+	uint64_t whole = h >> 8, fraction = h & 255u;
+	uint64_t tail = (fraction * eps_q) >> 8;
+	if (whole > (UINT64_MAX - tail) / eps_q) return UINT64_MAX;
+	uint64_t weighted = whole * eps_q + tail;
+	return weighted > UINT64_MAX - g ? UINT64_MAX : g + weighted;
+}
+
+void derech_search_avoiding(const derech_map *map, derech_search_ctx *ctx,
 	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
 	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
-	derech_search_result *out)
+	const derech_avoidance *avoid, uint32_t goalset, const derech_field *guide, derech_search_result *out)
 {
 	const uint32_t w = map->w;
 	const uint32_t gx = goal_idx % w;
@@ -184,10 +195,10 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 
 	touch(ctx, start_idx);
 	ctx->g[start_idx] = 0;
-	best_h = heuristic_q(prof, start_idx % w, start_idx / w, gx, gy);
+	best_h = goalset ? (guide && guide->dist_q[start_idx] != DERECH_G_INFINITE ? guide->dist_q[start_idx] : 0) : heuristic_q(prof, start_idx % w, start_idx / w, gx, gy);
 	best_g = 0;
 
-	e.f = ((uint64_t)eps_q * best_h) >> 8;
+	e.f = priority(0, best_h, eps_q);
 	e.g = 0;
 	e.idx = start_idx;
 	if (!heap_push(ctx, &heap_len, e)) {
@@ -210,9 +221,10 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 			out->error = DERECH_E_CANCELLED;
 			return;
 		}
-		if (cur == goal_idx) {
+		if ((goalset ? ((map->goalsets[goalset - 1].seeds[cur >> 6] >> (cur & 63u)) & 1u) : cur == goal_idx) &&
+			derech_avoidance_allows_step(avoid, cur % w, cur / w, cur % w, cur / w)) {
 			out->status = DERECH_PATH_FOUND;
-			out->end_idx = goal_idx;
+			out->end_idx = cur;
 			out->expansions = derech_sat_u32(expansions);
 			return;
 		}
@@ -226,7 +238,7 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 
 		x = cur % w;
 		y = cur / w;
-		h_cur = heuristic_q(prof, x, y, gx, gy);
+		h_cur = goalset ? (guide && guide->dist_q[cur] != DERECH_G_INFINITE ? guide->dist_q[cur] : 0) : heuristic_q(prof, x, y, gx, gy);
 		if (h_cur < best_h || (h_cur == best_h && e.g < best_g)) {
 			best_h = h_cur;
 			best_g = e.g;
@@ -245,7 +257,8 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 				continue;
 			}
 			nb = (uint32_t)ny * w + (uint32_t)nx;
-			if (derech_tile_blocked(map, prof, nb)) {
+			if (derech_tile_blocked(map, prof, nb) ||
+				!derech_avoidance_allows_step(avoid, x, y, (uint32_t)nx, (uint32_t)ny)) {
 				continue;
 			}
 			if (d >= 4 && corner_forbidden(map, prof, cur, d)) {
@@ -265,9 +278,9 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 			ctx->parent[nb] = (uint8_t)(d + 1);
 			ne.g = ng;
 			ne.idx = nb;
-			ne.f = ng + (((uint64_t)eps_q *
-				heuristic_q(prof, (uint32_t)nx, (uint32_t)ny,
-					gx, gy)) >> 8);
+			ne.f = priority(ng,
+				(goalset ? (guide && guide->dist_q[nb] != DERECH_G_INFINITE ? guide->dist_q[nb] : 0) : heuristic_q(prof, (uint32_t)nx, (uint32_t)ny,
+					gx, gy)), eps_q);
 			if (!heap_push(ctx, &heap_len, ne)) {
 				out->error = DERECH_E_NOMEM;
 				return;
@@ -279,4 +292,39 @@ void derech_search(const derech_map *map, derech_search_ctx *ctx,
 		DERECH_PATH_UNREACHABLE;
 	out->end_idx = best_idx;
 	out->expansions = derech_sat_u32(expansions);
+}
+
+void derech_search(const derech_map *map, derech_search_ctx *ctx,
+	const derech_profile *prof, uint32_t start_idx, uint32_t goal_idx,
+	uint32_t eps_q, uint64_t max_expansions, uint64_t max_cost_q,
+	derech_search_result *out)
+{
+	derech_search_avoiding(map, ctx, prof, start_idx, goal_idx, eps_q,
+		max_expansions, max_cost_q, NULL, 0, NULL, out);
+}
+
+int derech_avoidance_allows_step(const derech_avoidance *avoid,
+	uint32_t x, uint32_t y, uint32_t nx, uint32_t ny)
+{
+	int64_t vx = (int64_t)nx - x, vy = (int64_t)ny - y;
+	int64_t before = 0, after = 0;
+	int crossed = 0;
+	if (avoid == NULL || avoid->count == 0) return 1;
+	if (avoid->struct_size != sizeof(*avoid) || avoid->count > DERECH_AVOID_MAX || vx < -1 || vx > 1 || vy < -1 || vy > 1) return 0;
+	for (uint32_t i = 0; i < avoid->count; i++) {
+		const derech_avoid_circle *c = &avoid->circles[i];
+		int64_t dx = (int64_t)x - c->x, dy = (int64_t)y - c->y;
+		int64_t r = c->radius, rr, d0, d1, dot, vv = vx * vx + vy * vy;
+		if (r < 1 || r > 65535) return 0;
+		rr = r * r;
+		/* Bound products even for extreme public coordinate values. */
+		if (dx < -r - 1 || dx > r + 1 || dy < -r - 1 || dy > r + 1) continue;
+		d0 = dx * dx + dy * dy;
+		d1 = (dx + vx) * (dx + vx) + (dy + vy) * (dy + vy);
+		if (d0 < rr) before += rr - d0;
+		if (d1 < rr) after += rr - d1;
+		dot = -(dx * vx + dy * vy);
+		if (d0 < rr || d1 < rr || (dot > 0 && dot < vv && d0 * vv - dot * dot < rr * vv)) crossed = 1;
+	}
+	return before ? after < before : !crossed;
 }
