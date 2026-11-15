@@ -44,12 +44,12 @@ jobs:
             linkage: shared
             shared: 'ON'
             demos: 'ON'
-          - os: macos-14
+          - os: macos-15
             platform: arm64-apple-darwin
             linkage: static
             shared: 'OFF'
             demos: 'ON'
-          - os: macos-14
+          - os: macos-15
             platform: arm64-apple-darwin
             linkage: shared
             shared: 'ON'
