@@ -17,6 +17,7 @@ derech_map_generation
 derech_map_get_memory_stats
 derech_map_get_passability_at
 derech_map_get_tags_at
+derech_map_get_work_stats
 derech_map_height
 derech_map_memory_estimate
 derech_map_set_passability

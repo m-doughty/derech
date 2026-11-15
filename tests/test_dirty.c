@@ -150,7 +150,7 @@ static void test_relevant_at_and_after_overflow(void)
 			build_and_check(&f);
 			noise(&f, before, 32);
 			if (kind < 2) {
-				tag(&f, 20, 20, 1u << kind);
+				tag(&f, 20, 20, UINT64_C(1) << kind);
 			} else {
 				f.pass[20 * SIDE + 20] = 0.5f;
 				T_CHECK(derech_map_set_passability_at(f.map, 20, 20,

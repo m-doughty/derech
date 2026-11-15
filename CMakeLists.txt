@@ -179,7 +179,29 @@ if(DERECH_BUILD_TESTS)
 		concurrency extreme resource avoidance)
 	foreach(t IN LISTS DERECH_TEST_NAMES)
 		add_executable(test_${t} tests/test_${t}.c)
-		target_link_libraries(test_${t} PRIVATE derech_test_support)
+		if(BUILD_SHARED_LIBS AND t STREQUAL "dirty")
+			# This white-box test calls private symbols that stay hidden in the
+			# shared library. Compile an unmodified production copy into the test.
+			target_sources(test_${t} PRIVATE ${DERECH_SOURCES} tests/support.c)
+			target_include_directories(test_${t} PRIVATE
+				${CMAKE_CURRENT_SOURCE_DIR}/include
+				${DERECH_GENERATED_INCLUDE_DIR} tests src)
+			target_compile_definitions(test_${t} PRIVATE DERECH_BUILD DERECH_STATIC)
+			set_target_properties(test_${t} PROPERTIES C_VISIBILITY_PRESET hidden)
+			if(NOT WIN32)
+				target_link_libraries(test_${t} PRIVATE Threads::Threads m)
+			endif()
+			if(DERECH_SANITIZE)
+				target_compile_options(test_${t} PRIVATE
+					-fsanitize=address,undefined -fno-sanitize-recover=all)
+				target_link_options(test_${t} PRIVATE -fsanitize=address,undefined)
+			elseif(DERECH_TSAN)
+				target_compile_options(test_${t} PRIVATE -fsanitize=thread)
+				target_link_options(test_${t} PRIVATE -fsanitize=thread)
+			endif()
+		else()
+			target_link_libraries(test_${t} PRIVATE derech_test_support)
+		endif()
 		set_target_properties(test_${t} PROPERTIES
 			C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 		target_compile_options(test_${t} PRIVATE ${DERECH_C_WARNINGS})
